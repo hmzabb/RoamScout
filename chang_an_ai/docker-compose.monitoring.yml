@@ -1,4 +1,4 @@
-# 长安文旅AI - Prometheus + Grafana 监控栈
+# 游探AI - Prometheus + Grafana 监控栈
 # 启动: docker compose -f docker-compose.monitoring.yml up -d
 # Grafana: http://localhost:3000 (admin/admin)
 # Prometheus: http://localhost:9090

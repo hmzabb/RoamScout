@@ -18,14 +18,17 @@
   所有 Agent 相关导入放在 build_agent() 内部，仅在首次 Agent 请求时触发，
   服务启动秒开，RAG 模式完全不受影响。
 
-V3.0 防御增强：
-- 第三层：调用审计日志，检测异常调用模式
-- 集成 ToolGuard 参数校验
-- 增加调用统计和异常告警
+V3.0 防御增强（五层设计）：
+- 第一层：严格 JSON Schema 契约 + 版本管理
+- 第二层：动态工具检索 + 本地约束解码 + ToolGuard 参数校验
+- 第三层：Policy Engine（工具白名单 + 持久化幂等键 + 写操作人工确认）
+- 第四层：Token 预算控制（单轮 + 总预算 + 预警）
+- 第五层：Trace 全链路因果链串联
 - 第六层（可选）：结构化思考，强制推理步骤
 """
 import logging
 import json
+import time
 from typing import Dict, List, Any, Optional
 from collections import defaultdict
 
@@ -222,10 +225,18 @@ def build_agent():
     from app.agent.tools import ALL_TOOLS
     from app.agent.cache import CachedToolsWrapper
     from app.agent.parallel_tools import ParallelToolNode
+    from app.agent.tool_retriever import get_tool_retriever
+    from app.agent.policy_engine import get_policy_engine, PolicyDecision, PolicyAction
+    from app.agent.token_budget import get_session_budget, BudgetExceededError, TokenBudget
+    from app.agent.tracer import tracer, get_trace_id
 
     http_client = httpx.AsyncClient(verify=False, timeout=60.0)
 
-    model = ChatOpenAI(
+    # ==================== 第二层：动态工具检索 ====================
+    tool_retriever = get_tool_retriever()
+
+    # 构建工具检索用的模型（不绑定全部工具，而是在每轮动态 bind）
+    base_model = ChatOpenAI(
         model=settings.deepseek_model,
         api_key=settings.deepseek_api_key,
         base_url=settings.deepseek_base_url,
@@ -235,83 +246,407 @@ def build_agent():
         http_async_client=http_client,
     )
 
-    # 关键：bind_tools 返回新对象，必须赋值回 model，否则 API 请求不含 tools 字段
-    model = model.bind_tools(ALL_TOOLS)
-    logger.info(f"Agent 构建完成: model={settings.deepseek_model}, tools={len(ALL_TOOLS)}, recursion_limit={RECURSION_LIMIT}")
+    # 默认绑定全部工具（兜底）
+    fallback_model = base_model.bind_tools(ALL_TOOLS)
 
     # 使用带缓存的工具包装器
     cached_tools = CachedToolsWrapper(ALL_TOOLS)
     cached_tool_list = cached_tools.get_cached_tools()
 
+    # ==================== 第三层：Policy Engine ====================
+    policy_engine = get_policy_engine()
+
+    logger.info(
+        f"Agent 构建完成: model={settings.deepseek_model}, "
+        f"tools={len(ALL_TOOLS)}, "
+        f"recursion_limit={RECURSION_LIMIT}, "
+        f"五层防御: 动态检索={settings.dynamic_tool_retrieval_enabled}, "
+        f"策略引擎={settings.policy_engine_enabled}, "
+        f"预算控制={settings.token_budget_enabled}, "
+        f"Trace={settings.tracing_enabled}"
+    )
+
     # 构建自定义状态图（支持并行工具执行）
     workflow = StateGraph(AgentState)
 
     async def agent_node(state: AgentState):
-        """LLM Agent 节点：决定是否调用工具（含第三层审计 + 第六层结构化思考）"""
+        """LLM Agent 节点：决定是否调用工具（含五层防御 + 第六层结构化思考）"""
         messages = state["messages"]
+        trace_id = state.get("trace_id") or get_trace_id()
+        session_id = state.get("session_id", "")
 
-        # 提取用户查询用于日志
+        # 提取用户查询用于日志和工具检索
         user_query = ""
         for msg in reversed(messages):
             if hasattr(msg, 'type') and msg.type == 'human':
-                user_query = msg.content[:100]  # 增长到100字符以便更准确审计
+                user_query = msg.content[:100]
                 break
 
-        # 第六层防御（可选）：结构化思考
-        from app.agent.structured_thinking import StructuredThinking
-
-        if StructuredThinking.is_enabled():
-            think_result = await StructuredThinking.force_think(model, user_query)
-            if think_result and not think_result.is_valid:
-                logger.warning(
-                    f"[Agent] 第六层拦截：结构化思考结果无效 | "
-                    f"意图: {think_result.user_intent} | "
-                    f"相关: {think_result.is_travel_related}"
-                )
-                # 可以选择拒绝或继续（这里选择继续但记录警告）
-
-        response = await model.ainvoke(messages)
-
-        # 第三层防御：调用审计
-        if hasattr(response, 'tool_calls') and response.tool_calls:
-            tools = [tc['name'] for tc in response.tool_calls]
-
-            # 执行审计
-            audit_warnings = ToolCallAuditor.audit_tool_calls(
-                user_query=user_query,
-                tool_calls=response.tool_calls
+        # ==================== 第四层：任务级总超时（wall-clock） ====================
+        task_deadline = state.get("task_deadline")
+        if task_deadline is None:
+            task_deadline = time.time() + settings.max_task_duration_seconds
+        elif time.time() > task_deadline:
+            logger.warning(
+                f"[{trace_id}] ⏱ 任务总超时({settings.max_task_duration_seconds}s)已耗尽，"
+                f"强制终止（当前第 {state.get('iter', 0)} 轮）"
             )
+            return {
+                "messages": [{
+                    "role": "assistant",
+                    "content": (
+                        "抱歉，本次查询耗时较长已超出处理时限。"
+                        "已获取的信息我无法完整整理，建议您稍后重试，或缩小查询范围～"
+                    ),
+                }],
+                "iter": state.get("iter", 0) + 1,
+                "param_retry": 0,
+                "need_param_retry": False,
+                "task_deadline": task_deadline,
+            }
 
-            # 如果有严重警告，记录到日志
-            critical_warnings = [w for w in audit_warnings if "编造" in w or "直接调" in w]
-            if critical_warnings:
-                logger.error(
-                    f"[Agent] ⚠️ 严重异常检测到! "
-                    f"用户: {user_query} | 工具: {tools} | 警告: {critical_warnings}"
+        # ==================== 第五层：Trace - agent_think span ====================
+        think_span = None
+        if settings.tracing_enabled:
+            think_span_ctx = tracer.span("agent_think", tags={
+                "round": state.get("iter", 0),
+                "query": user_query[:50],
+            })
+            think_span = think_span_ctx.__enter__()
+
+        try:
+            # ==================== 第四层：Token 预算检查 ====================
+            if settings.token_budget_enabled and session_id:
+                try:
+                    budget = get_session_budget(session_id)
+                    budget.check_before_call(round_num=state.get("iter", 0))
+
+                    if think_span:
+                        status = budget.get_status()
+                        think_span.set_tag("budget_usage", status.usage_ratio)
+                        think_span.set_tag("budget_remaining", status.remaining_tokens)
+                except BudgetExceededError as e:
+                    logger.warning(f"[{trace_id}] ⛔ Token预算超限: {e}")
+                    return {
+                        "messages": [{
+                            "role": "assistant",
+                            "content": "抱歉，当前会话已达到处理上限。请开启新会话继续交流~"
+                        }],
+                        "param_retry": 0,
+                        "need_param_retry": False,
+                        "task_deadline": task_deadline,
+                    }
+
+            # ==================== 第六层防御（可选）：结构化思考 ====================
+            from app.agent.structured_thinking import StructuredThinking
+
+            if StructuredThinking.is_enabled():
+                think_result = await StructuredThinking.force_think(base_model, user_query)
+                if think_result and not think_result.is_valid:
+                    logger.warning(
+                        f"[{trace_id}] 第六层拦截：结构化思考结果无效 | "
+                        f"意图: {think_result.user_intent} | "
+                        f"相关: {think_result.is_travel_related}"
+                    )
+                if think_span:
+                    think_span.set_tag(
+                        "structured_thinking_valid",
+                        think_result.is_valid if think_result else False
+                    )
+
+            # ==================== 第二层·防护3：工具检索（语义+关键词混合 Top-K） ====================
+            if settings.dynamic_tool_retrieval_enabled:
+                filtered_tools = await tool_retriever.aretrieve(user_query)
+                current_model = base_model.bind_tools(filtered_tools)
+                logger.debug(f"[{trace_id}] 工具检索: {len(filtered_tools)}/{len(ALL_TOOLS)} 个工具")
+                if think_span:
+                    think_span.set_tag("retrieved_tools", [t.name for t in filtered_tools])
+            else:
+                current_model = fallback_model
+
+            # ==================== 核心调用 ====================
+            call_start = time.time()
+            response = await current_model.ainvoke(messages)
+            call_elapsed = time.time() - call_start
+
+            # ==================== 第四层：Token 预算记录 ====================
+            if settings.token_budget_enabled and session_id:
+                input_tokens = state.get("round_input_tokens", 0) or TokenBudget.estimate_tokens(
+                    "\n".join([m.content if hasattr(m, 'content') else "" for m in messages[-3:]])
+                )
+                output_tokens = TokenBudget.estimate_tokens(
+                    response.content if hasattr(response, 'content') and response.content else ""
+                )
+                if hasattr(response, 'tool_calls') and response.tool_calls:
+                    output_tokens += TokenBudget.estimate_tokens(
+                        json.dumps(response.tool_calls, ensure_ascii=False)
+                    )
+                budget = get_session_budget(session_id)
+                budget.record_usage(input_tokens, output_tokens, round_num=state.get("iter", 0))
+
+            # ==================== 第五层：单任务 token 成本埋点 ====================
+            # 与预算控制解耦：即使未开启预算，也要把 token 成本记入 trace，
+            # 这样才能回答"单次任务花了多少 token"。
+            if settings.tracing_enabled:
+                _trace = tracer.get_current_trace()
+                if _trace:
+                    _in_tokens = TokenBudget.estimate_tokens(
+                        "\n".join([
+                            m.content if hasattr(m, "content") and m.content else ""
+                            for m in messages[-3:]
+                        ])
+                    )
+                    _out_tokens = TokenBudget.estimate_tokens(
+                        response.content
+                        if hasattr(response, "content") and response.content else ""
+                    )
+                    if hasattr(response, "tool_calls") and response.tool_calls:
+                        _out_tokens += TokenBudget.estimate_tokens(
+                            json.dumps(response.tool_calls, ensure_ascii=False)
+                        )
+                    _trace.record_tokens(_in_tokens, _out_tokens)
+                    if think_span:
+                        think_span.set_tag("round_tokens", _in_tokens + _out_tokens)
+
+            # ==================== 第二层·防护1+2：约束解码 + 参数校验 ====================
+            if hasattr(response, 'tool_calls') and response.tool_calls:
+                tools = [tc['name'] for tc in response.tool_calls]
+
+                # 第五层：参数校验独立 span（因果链中的"参数校验"环节）
+                pv_span = None
+                pv_span_ctx = None
+                if settings.tracing_enabled:
+                    pv_span_ctx = tracer.span("param_validation", tags={
+                        "round": state.get("iter", 0),
+                        "tools": tools,
+                        "calls_count": len(response.tool_calls),
+                    })
+                    pv_span = pv_span_ctx.__enter__()
+
+                constraint_errors = tool_retriever.validate_tool_calls(response.tool_calls)
+                if pv_span:
+                    pv_span.set_tag("violations", constraint_errors)
+                    pv_span.set_tag("passed", not constraint_errors)
+                    pv_span_ctx.__exit__(None, None, None)
+
+                if constraint_errors:
+                    retry_count = state.get("param_retry", 0)
+                    logger.error(
+                        f"[{trace_id}] 第二层校验拦截 {len(constraint_errors)} 个违规 "
+                        f"(retry={retry_count}/{settings.param_validation_max_retry}): "
+                        f"{constraint_errors}"
+                    )
+                    if think_span:
+                        think_span.set_tag("constraint_violations", constraint_errors)
+                        think_span.set_tag("param_retry", retry_count)
+
+                    # 回传真实报错让模型修正（不执行非法调用）
+                    if (
+                        settings.constrained_decode_retry_on_error
+                        and retry_count < settings.param_validation_max_retry
+                    ):
+                        from langchain_core.messages import AIMessage, ToolMessage
+                        from app.agent.param_validator import get_param_validator
+
+                        param_errors = tool_retriever.collect_param_errors(response.tool_calls)
+                        feedback = (
+                            get_param_validator().format_for_llm(param_errors)
+                            if param_errors else "\n".join(constraint_errors)
+                        )
+
+                        blocked_calls = []
+                        tool_messages = []
+                        for idx, tc in enumerate(response.tool_calls):
+                            call_id = tc.get("id") or f"blocked_{state.get('iter', 0)}_{idx}"
+                            blocked_calls.append({
+                                "name": tc.get("name", ""),
+                                "args": tc.get("args") or {},
+                                "id": call_id,
+                                "type": "tool_call",
+                            })
+                            tool_messages.append(ToolMessage(
+                                content=f"⚠️ 该调用被参数校验拦截，未执行。\n{feedback}",
+                                tool_call_id=call_id,
+                            ))
+
+                        return {
+                            "messages": [
+                                AIMessage(content="", tool_calls=blocked_calls),
+                                *tool_messages,
+                            ],
+                            "iter": state.get("iter", 0) + 1,
+                            "param_retry": retry_count + 1,
+                            "need_param_retry": True,
+                            "task_deadline": task_deadline,
+                        }
+
+                    # 超过重试上限：直接给用户兜底答复，避免死循环
+                    logger.error(f"[{trace_id}] 参数校验重试超限，终止本轮")
+                    return {
+                        "messages": [{
+                            "role": "assistant",
+                            "content": "抱歉，我没能正确组装查询参数。可以换个说法，或直接告诉我想查的店铺/分类名称～",
+                        }],
+                        "iter": state.get("iter", 0) + 1,
+                        "param_retry": 0,
+                        "need_param_retry": False,
+                        "task_deadline": task_deadline,
+                    }
+
+                # ==================== 第三层：Policy Engine 规则检查 ====================
+                if settings.policy_engine_enabled:
+                    for tc in response.tool_calls:
+                        tool_name = tc.get("name", "")
+                        tool_args = tc.get("args", {})
+
+                        policy_decision = await policy_engine.evaluate(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            context={
+                                "session_id": session_id,
+                                "trace_id": trace_id,
+                                "user_query": user_query,
+                            }
+                        )
+
+                        if policy_decision.action == PolicyAction.REQUIRE_CONFIRM:
+                            logger.info(
+                                f"[{trace_id}] 第三层策略引擎：{tool_name} 需要人工确认, "
+                                f"token={policy_decision.confirm_token}"
+                            )
+                            return {
+                                "messages": [{
+                                    "role": "assistant",
+                                    "content": json.dumps({
+                                        "confirm_required": True,
+                                        "confirm_token": policy_decision.confirm_token,
+                                        "confirm_message": policy_decision.confirm_message,
+                                        "tool_name": tool_name,
+                                        "tool_args": tool_args,
+                                    }, ensure_ascii=False),
+                                }],
+                                "param_retry": 0,
+                                "need_param_retry": False,
+                                "task_deadline": task_deadline,
+                            }
+
+                        if not policy_decision.allowed:
+                            logger.warning(
+                                f"[{trace_id}] 第三层策略引擎拒绝: {tool_name} → {policy_decision.reason}"
+                            )
+                            response.content = (
+                                f"抱歉，操作「{tool_name}」暂时无法执行：{policy_decision.reason}"
+                            )
+                            response.tool_calls = None
+                            break
+
+                # ==================== 第三层：调用审计（保留原有审计器） ====================
+                audit_warnings = ToolCallAuditor.audit_tool_calls(
+                    user_query=user_query,
+                    tool_calls=response.tool_calls
                 )
 
-            logger.info(f"[Agent] {user_query} -> 调用工具: {tools}")
-        else:
-            logger.info(f"[Agent] {user_query} -> 直接回答 (未调用工具)")
+                # 第五层指标：漏调用/误触发信号
+                try:
+                    from app.agent.tracer import get_metrics_collector
+                    has_miss = any("未调用必要工具" in w for w in audit_warnings)
+                    has_extra = any("请确认用户的真实意图" in w for w in audit_warnings)
+                    get_metrics_collector().record_audit(
+                        has_miss=has_miss, has_extra=has_extra
+                    )
+                except Exception as e:
+                    logger.debug(f"[{trace_id}] 指标埋点失败: {e}")
 
-        return {"messages": [response]}
+                critical_warnings = [w for w in audit_warnings if "编造" in w or "直接调" in w]
+                if critical_warnings:
+                    logger.error(
+                        f"[{trace_id}] ⚠️ 严重异常检测到! "
+                        f"用户: {user_query} | 工具: {tools} | 警告: {critical_warnings}"
+                    )
 
-    # 使用并行工具节点替代默认 ToolNode（含第四层结果质量检查）
+                logger.info(f"[{trace_id}] Agent: {user_query} -> 调用工具: {tools} | 耗时: {call_elapsed:.2f}s")
+            else:
+                logger.info(f"[{trace_id}] Agent: {user_query} -> 直接回答 | 耗时: {call_elapsed:.2f}s")
+
+            # 记录 trace 标签
+            if think_span:
+                if hasattr(response, 'tool_calls') and response.tool_calls:
+                    think_span.set_tag("tools_called", [tc['name'] for tc in response.tool_calls])
+                    think_span.set_tag("tools_count", len(response.tool_calls))
+                else:
+                    think_span.set_tag("direct_answer", True)
+
+            return {
+                "messages": [response],
+                "iter": state.get("iter", 0) + 1,
+                "param_retry": 0,
+                "need_param_retry": False,
+                "task_deadline": task_deadline,
+            }
+
+        finally:
+            if think_span_ctx:
+                think_span_ctx.__exit__(None, None, None)
+
+    # 使用并行工具节点替代默认 ToolNode（含第四层结果质量检查 + 第五层Trace）
     parallel_tool_node = ParallelToolNode(tools=cached_tool_list)
 
+    # 包装工具节点，添加 Trace
+    async def traced_tools_node(state: AgentState):
+        """带 Trace 的工具执行节点。"""
+        trace_id = state.get("trace_id") or get_trace_id()
+        tool_calls_info = []
+
+        last_message = state["messages"][-1]
+        if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+            tool_calls_info = [tc['name'] for tc in last_message.tool_calls]
+
+        with tracer.span("tools_execution", tags={
+            "round": state.get("iter", 0),
+            "tools": tool_calls_info,
+            "tools_count": len(tool_calls_info),
+        }) as tools_span:
+            result = await parallel_tool_node.run(state)
+            if tools_span:
+                tools_span.set_tag("result_count", len(result.get("messages", [])))
+            return result
+
     workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", parallel_tool_node)
+    workflow.add_node("tools", traced_tools_node)
 
     workflow.set_entry_point("agent")
 
     def should_continue(state: AgentState):
-        """条件边判断：有 tool_calls 则执行工具，否则结束"""
+        """条件边判断：参数校验重试优先，其次有 tool_calls 则执行工具，否则结束。
+
+        第四层：所有分支都做轮数二次检查，防止重试/工具调用叠加导致死循环。
+        """
+        # 第二层：参数校验失败 → 回 agent 节点让模型修正后重生成
+        if state.get("need_param_retry"):
+            if state.get("iter", 0) >= MAX_TOOL_ROUNDS:
+                logger.warning(
+                    f"[{state.get('trace_id', 'no-trace')}] "
+                    f"参数修正已达最大轮数 {MAX_TOOL_ROUNDS}，强制结束"
+                )
+                return END
+            return "retry"
+
         last_message = state["messages"][-1]
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            if state.get("iter", 0) >= MAX_TOOL_ROUNDS:
+                logger.warning(
+                    f"[{state.get('trace_id', 'no-trace')}] "
+                    f"已达最大工具调用轮数 {MAX_TOOL_ROUNDS}，强制结束"
+                )
+                return END
             return "tools"
         return END
 
-    workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+    workflow.add_conditional_edges(
+        "agent",
+        should_continue,
+        {"tools": "tools", "retry": "agent", END: END},
+    )
     workflow.add_edge("tools", "agent")
 
     return workflow.compile()

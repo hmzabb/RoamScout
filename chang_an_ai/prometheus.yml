@@ -1,4 +1,4 @@
-# Prometheus 配置 - 长安文旅AI服务监控
+# Prometheus 配置 - 游探AI服务监控
 # 用法: docker compose up -d
 
 global:

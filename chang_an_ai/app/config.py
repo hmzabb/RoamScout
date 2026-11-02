@@ -64,5 +64,64 @@ class Settings(BaseSettings):
     app_host: str = "127.0.0.1"
     app_port: int = 8000
 
+    # ---- Function Calling 五层防御体系 ----
+    # 第二层·防护1：约束解码（Grammar-Constrained Decoding）
+    # 推理引擎后端：api（云API+响应侧修复）| vllm（guided_json）| llamacpp（GBNF）
+    guided_decoding_backend: str = "api"
+    constrained_decoding_enabled: bool = True  # 启用响应侧语法约束
+    constrained_decode_max_repair: int = 1  # JSON 语法修复失败后的重试次数
+    constrained_decode_retry_on_error: bool = True  # 参数校验失败时回传错误让模型自我修正
+
+    # 第二层·防护2：参数校验（JSON Schema 编译校验）
+    param_validation_enabled: bool = True  # 启用执行前 Schema 级参数校验
+    param_validation_max_retry: int = 2  # 同一轮内模型修正参数的最大重试次数
+
+    # 第二层·防护3：工具检索（语义 + 关键词混合 Top-K）
+    dynamic_tool_retrieval_enabled: bool = True  # 启用后根据用户意图动态筛选工具
+    max_tools_per_request: int = 5  # 最终绑定给LLM的工具数上限
+    tool_retrieval_top_k: int = 10  # 检索候选池大小（Top-K，工具规模大时调至10~20）
+    tool_retrieval_semantic_weight: float = 0.7  # 语义相似度权重
+    tool_retrieval_keyword_weight: float = 0.3  # 关键词命中权重
+    tool_retrieval_min_score: float = 0.15  # 候选池最低入选分数，低于则丢弃
+    tool_retrieval_cache_ttl: int = 86400  # 工具向量索引缓存时间（秒）
+
+    # 第三层：Policy Engine（安全治理层）
+    policy_engine_enabled: bool = True  # 启用策略引擎
+    policy_write_requires_confirm: bool = True  # 写操作需要人工确认
+    policy_money_requires_confirm: bool = True  # 涉及金额的操作需要人工确认
+    idempotency_persist: bool = True  # 幂等键持久化到Redis
+    idempotency_inject_request_id: bool = True  # 写操作自动注入 request_id 供下游去重
+
+    # 第四层：循环控制（轮数 + 预算 + 总超时）
+    token_budget_enabled: bool = True  # 启用token预算
+    max_total_tokens_per_session: int = 16000  # 单会话最大token消耗
+    max_tokens_per_round: int = 4000  # 单轮最大token消耗
+    warning_token_ratio: float = 0.8  # 达到80%预算时告警
+    max_task_duration_seconds: float = 90.0  # 单任务总超时（wall-clock），超时强制终止
+    read_tool_timeout_seconds: float = 15.0  # 读操作单次超时（可快速重试）
+    write_tool_timeout_seconds: float = 30.0  # 写操作单次超时（超时标记UNKNOWN，不可重试）
+    max_tool_retry_per_call: int = 2  # 单个工具调用允许的重试次数上限
+
+    # 第五层：Trace（可观测层）
+    tracing_enabled: bool = True  # 启用trace
+    trace_sample_rate: float = 1.0  # 采样率（1.0=全量，0.1=10%）
+    trace_redis_ttl: int = 3600  # trace在Redis中的保留时间（秒）
+    metrics_enabled: bool = True  # 启用指标聚合（延迟P95/失败率/重试次数等）
+
+    # 工具Schema版本
+    tool_schema_version: str = "1.0.0"
+
+
+# =============================================================================
+# 城市/领域画像：换城市只需改这里 + 换语料，代码零改动
+# =============================================================================
+CITY_PROFILE = {
+    "city": "西安",                     # 城市名
+    "scope": "西安及周边",               # 地域范围（RAG/Agent 提示词中拼接）
+    "domain": "西安文旅",                # 领域标签（守卫分类器使用）
+    "app_name": "游探APP",              # APP名称
+    "rejection_scope_desc": "西安的景点、美食或游玩攻略",  # 拒答引导语
+}
+
 
 settings = Settings()

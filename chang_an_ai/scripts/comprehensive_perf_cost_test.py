@@ -288,7 +288,7 @@ def cost_analysis():
     print("=" * 70)
 
     # RAG 系统提示词（来自 rag.py）
-    RAG_SYS = """你是「长安文旅探店助手」，一个面向游客的西安文旅智能问答助手。
+    RAG_SYS = """你是「游探AI」，一个面向游客的城市文旅智能问答助手。
 回答规则（必须严格遵守）：
 1. 只根据【知识库片段】回答，禁止使用你自己的知识编造任何信息；
 2. 引用知识库内容时，在句末标注来源编号；
@@ -533,7 +533,7 @@ def save_report(all_results):
     # Markdown
     md_path = project_root / "comprehensive_perf_cost_report.md"
     lines = [
-        f"# 长安文旅AI系统 - 性能与成本测试报告",
+        f"# 游探AI系统 - 性能与成本测试报告",
         f"",
         f"**测试时间**: {NOW}",
         f"**模型**: {settings.deepseek_model}",
@@ -556,7 +556,7 @@ def save_report(all_results):
 
 def main():
     print("=" * 70)
-    print("  🔬 长安文旅AI系统 - 综合性能与成本测试")
+    print("  🔬 游探AI系统 - 综合性能与成本测试")
     print(f"  {NOW}")
     print("=" * 70)
     print(f"  LLM:       {settings.deepseek_model}")

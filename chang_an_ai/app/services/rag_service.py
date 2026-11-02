@@ -71,7 +71,7 @@ def answer(query: str, history: list[dict]):
 
     前置判别（LLM 领域守卫）：
     - 用 DeepSeek-chat 做一次轻量分类（temperature=0, max_tokens=5, timeout=5s），
-      判断查询是否属于「西安文旅」范畴，非领域查询直接礼貌拒答，跳过后续 RAG 管线；
+      判断查询是否属于当前城市文旅范畴，非领域查询直接礼貌拒答，跳过后续 RAG 管线；
     - 分类失败时降级放行（宁可漏判也不阻塞正常问答），成本约 ¥0.0002/条。
 
     防幻觉三板斧：
@@ -82,7 +82,7 @@ def answer(query: str, history: list[dict]):
 
     检索用改写后的 query（指代还原），生成用用户原话（保留语气和意图）。
     """
-    # ── LLM 前端判别：拦截非西安文旅查询 ──
+    # ── LLM 前端判别：拦截非领域查询 ──
     yield ("status", "正在分析问题…")
     try:
         resp = chat_sync(

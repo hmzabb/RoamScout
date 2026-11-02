@@ -1,7 +1,7 @@
 """文本分块 + 结构化数据模板化。
 
-- 语料 md：按 ## 二级标题切（语义边界），目标 400-600 字一块，超长续切并带 120 字
-  overlap（20%，业界推荐区间 15-25%）。为什么按标题不按固定字数？固定字数会把"大雁塔历史"和"大雁塔开放时间"
+- 语料 md：按 ## 二级标题切（语义边界），目标 400-600 字一块，超长续切并带 70 字
+  overlap（约 10%）。为什么按标题不按固定字数？固定字数会把"大雁塔历史"和"大雁塔开放时间"
   切开重组，命中的块语义不完整；标题是作者标好的语义边界，优先信任它。
 - 结构化记录（店铺/笔记/券）：一条记录 = 一个 chunk，不硬切。一条店铺信息是原子
   语义单元（几百字以内），切碎了反而丢信息。用模板把字段拼成自然中文——向量模型
@@ -14,8 +14,8 @@ import re # 正则：HTML 标签清洗、句子边界切分
 from dataclasses import dataclass, field
 
 # ---- 分块参数 ----
-CHUNK_MAX = 600   # 超过此长度的小节续切
-OVERLAP = 120      # 续切时相邻块重叠字数，防止关键句被切断
+CHUNK_MAX = 600   # 超过此长度的小节续切（A/B实验：corpus 小节平均 500 字，600 最优）
+OVERLAP = 70       # 续切相邻块重叠字数，约 10%（A/B实验：20%=Prec52.2% vs 10%=Prec52.1%，选 10% 减少冗余）
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")  # 笔记 是markdown形式 是富文本（含 <br/> 等标签）
 
@@ -150,7 +150,7 @@ def _split_long(text: str) -> list[str]:
     for sent in sentences:
         if len(buf) + len(sent) > CHUNK_MAX and buf:#and buf防止第一轮就超限
             blocks.append(buf.strip())
-            buf = buf[-OVERLAP:] + sent  # 重叠：上一块尾部 80 字带进下一块
+            buf = buf[-OVERLAP:] + sent  # 重叠：上一块尾部 70 字带进下一块
         else:
             buf += sent
     if buf.strip():
@@ -302,3 +302,226 @@ def voucher_to_text(voucher: dict, shop_name: str = "") -> str:
         f"。{stock_text}。{time_text}。"
         f"使用规则：{rules_text}。"
     )
+
+
+# ==================== 递归字符切分（baseline，全格式通用） ====================
+
+def _recursive_split(
+    text: str,
+    separators: list[str] | None = None,
+    chunk_size: int = 500,
+    overlap: int = 100,
+) -> list[str]:
+    """纯递归字符切分：按 separators 优先级逐级切，贪心装箱 + 重叠。
+
+    通过函数递归来实现"逐级切分"——当前级别切出的片段如果还是超长，
+    就调用自己用下一级分隔符继续切。不需要显式的栈/队列数据结构，
+    代码更短且语义直观。这就是"递归切分"名称的由来。
+
+    参数：
+      separators: 分隔符优先级列表，默认 ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+      chunk_size: 目标块最大长度
+      overlap: 相邻块重叠字符数
+
+    实现要点：
+      1. 用当前分隔符切分
+      2. 贪心装箱：当前片上片 ≤ chunk_size → 合并
+      3. 超长的片 → 递归用下一级分隔符继续切
+      4. 相邻块尾部和首部 overlap 字重叠
+    """
+    if separators is None:
+        separators = ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+
+    separator = separators[0]
+    remaining_separators = separators[1:]
+
+    if separator:
+        pieces = text.split(separator)
+    else:
+        pieces = list(text)
+
+    blocks: list[str] = []
+    buf = ""
+    for piece in pieces:
+        if separator:
+            piece_with_sep = piece + separator if piece != pieces[-1] else piece
+        else:
+            piece_with_sep = piece
+
+        if len(buf) + len(piece_with_sep) <= chunk_size:
+            buf += piece_with_sep
+        else:
+            if buf.strip():
+                blocks.append(buf.strip())
+            if len(piece_with_sep) > chunk_size and remaining_separators:
+                sub_pieces = _recursive_split(
+                    piece_with_sep, remaining_separators, chunk_size, overlap
+                )
+                blocks.extend(sub_pieces)
+            else:
+                buf = piece_with_sep
+
+    if buf.strip():
+        blocks.append(buf.strip())
+
+    if overlap > 0 and len(blocks) > 1:
+        overlapped: list[str] = [blocks[0]]
+        for i in range(1, len(blocks)):
+            prev_tail = blocks[i - 1][-overlap:] if len(blocks[i - 1]) >= overlap else blocks[i - 1]
+            overlapped.append(prev_tail + blocks[i])
+        return overlapped
+
+    return blocks
+
+
+def chunk_recursive(
+    text: str,
+    doc_title: str,
+    file_name: str = "",
+    chunk_size: int = 500,
+    overlap: int = 100,
+) -> list[Chunk]:
+    """递归字符切分 → 若干 Chunk。全格式通用，不感知文档结构。
+
+    这是最朴素的 baseline 策略——不管你是 Markdown 还是 PDF 还是 Word，
+    全部当纯文本按固定字符数切。实现最快、最通用，但可能把紧邻的语义单元
+    （如"门票价格"和"购票须知"）切到两个块里。
+    """
+    pieces = _recursive_split(text, chunk_size=chunk_size, overlap=overlap)
+    chunks: list[Chunk] = []
+    for i, piece in enumerate(pieces):
+        chunks.append(
+            Chunk(
+                text=piece,
+                metadata={
+                    "source": "corpus",
+                    "doc": doc_title,
+                    "file": file_name,
+                    "section": "正文",
+                    "part": i,
+                },
+            )
+        )
+    return chunks
+
+
+# ==================== 父子文档切分 ====================
+
+@dataclass
+class ParentChunk:
+    """父块：包含完整上下文的较大文本块，不做 embedding。
+
+    检索时命中 Child → 通过 parent_id 取出对应的 ParentChunk → 把 Parent.text
+    注入 LLM，确保 LLM 拿到完整的上下文窗口。
+    """
+
+    id: str
+    text: str
+    metadata: dict = field(default_factory=dict)
+
+
+def chunk_parent_child(
+    text: str,
+    doc_title: str,
+    file_name: str = "",
+    child_size: int = 400,
+    parent_strategy: str = "doc",
+    overlap: int = 80,
+) -> tuple[list[Chunk], dict[str, ParentChunk]]:
+    """父子文档切分 → (Child Chunk 列表, parent_id → ParentChunk 映射)。
+
+    Child 小颗粒（精确检索）→ 存入 Milvus 做 embedding 检索。
+    Parent 大颗粒（完整上下文）→ 检索命中 Child 后，根据 parent_id 取出 Parent，
+    将 Parent 文本注入 LLM prompt。
+
+    parent_strategy:
+      - "doc": 整篇文档作为一个 Parent（适合 corpus 中文档 ≤3000 字）
+      - "fixed": 固定大小 Parent，按 parent_size 切分
+      - "section": 按 ## 二级标题的自然小节作为 Parent
+    """
+    children: list[Chunk] = []
+    parents: dict[str, ParentChunk] = {}
+    parent_idx = 0
+
+    if parent_strategy == "section":
+        sections = _split_by_headings(text)
+        for section_title, body in sections:
+            section_text = f"{section_title}\n{body}"
+            p_id = f"{doc_title}:p{parent_idx}"
+            parents[p_id] = ParentChunk(
+                id=p_id,
+                text=section_text,
+                metadata={"doc": doc_title, "file": file_name, "section": section_title},
+            )
+
+            pieces = _recursive_split(body, chunk_size=child_size, overlap=overlap)
+            for i, piece in enumerate(pieces):
+                children.append(
+                    Chunk(
+                        text=f"{section_title}\n{piece}",
+                        metadata={
+                            "source": "corpus",
+                            "doc": doc_title,
+                            "file": file_name,
+                            "section": section_title,
+                            "part": i,
+                            "parent_id": p_id,
+                        },
+                    )
+                )
+            parent_idx += 1
+
+    elif parent_strategy == "fixed":
+        parent_size = int(child_size * 3)
+        while text:
+            p_text = text[:parent_size]
+            text = text[parent_size:]
+            p_id = f"{doc_title}:p{parent_idx}"
+            parents[p_id] = ParentChunk(
+                id=p_id,
+                text=p_text,
+                metadata={"doc": doc_title, "file": file_name, "section": "正文"},
+            )
+
+            pieces = _recursive_split(p_text, chunk_size=child_size, overlap=overlap)
+            for i, piece in enumerate(pieces):
+                children.append(
+                    Chunk(
+                        text=piece,
+                        metadata={
+                            "source": "corpus",
+                            "doc": doc_title,
+                            "file": file_name,
+                            "section": "正文",
+                            "part": i,
+                            "parent_id": p_id,
+                        },
+                    )
+                )
+            parent_idx += 1
+
+    else:
+        p_id = f"{doc_title}:p0"
+        parents[p_id] = ParentChunk(
+            id=p_id,
+            text=text,
+            metadata={"doc": doc_title, "file": file_name, "section": "整篇"},
+        )
+
+        pieces = _recursive_split(text, chunk_size=child_size, overlap=overlap)
+        for i, piece in enumerate(pieces):
+            children.append(
+                Chunk(
+                    text=piece,
+                    metadata={
+                        "source": "corpus",
+                        "doc": doc_title,
+                        "file": file_name,
+                        "section": "正文",
+                        "part": i,
+                        "parent_id": p_id,
+                    },
+                )
+            )
+
+    return children, parents

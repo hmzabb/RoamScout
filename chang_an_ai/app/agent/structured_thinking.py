@@ -37,7 +37,7 @@ class AgentThink(BaseModel):
     1. 明确分析用户意图
     2. 列出需要的工具及理由
     3. 验证参数的合理性
-    4. 确认是否与西安文旅相关
+    4. 确认是否与当前城市文旅相关
     """
 
     user_intent: str = Field(
@@ -61,7 +61,7 @@ class AgentThink(BaseModel):
 
     is_travel_related: bool = Field(
         ...,
-        description="是否与西安文旅相关（True/False）"
+        description="是否与当前城市文旅相关（True/False）"
     )
 
     confidence: float = Field(
@@ -96,7 +96,7 @@ class AgentThink(BaseModel):
     @property
     def is_valid(self) -> bool:
         """快速验证思考结果是否合理。"""
-        # 必须与西安文旅相关
+        # 必须与当前城市文旅相关
         if not self.is_travel_related:
             return False
 
@@ -171,10 +171,10 @@ class StructuredThinking:
 - get_shop_detail: 查店铺详情（需要shop_id）
 - list_vouchers: 查优惠券（需要shop_id）
 - search_blogs: 搜索探店笔记/评价
-- search_knowledge: 搜索西安文旅知识
+- search_knowledge: 搜索城市文旅知识
 
 【判断规则】
-1. is_travel_related: 只有与西安旅游、美食、景点、攻略相关的才为true
+1. is_travel_related: 只有与当前城市旅游、美食、景点、攻略相关的才为true
 2. needed_tools: 根据用户需求选择最合适的工具组合
 3. confidence: 对自己判断的信心程度（0-1）
 4. potential_issues: 可能的问题（如缺少必要参数、可能返回空结果等）

@@ -45,3 +45,14 @@ Thumbs.db
 .$null
 
 chang_an_ai/DEFENSE_SYSTEM_V3.md
+
+# ==================== 临时文件 ====================
+_tmp_*
+
+# ==================== 测试/评测输出文件 ====================
+result*.txt
+pytest_out.txt
+test_result.txt
+*_out*.txt
+chang_an_ai/scripts/eval_chunking_ab_*.txt
+chang_an_ai/scripts/eval_chunking_ab_*.json

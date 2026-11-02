@@ -180,6 +180,7 @@ class RouteType(Enum):
     RAG = "rag"
     CHAT = "chat"
     REJECT = "reject"
+    SERVICE = "service"  # V3: 客服场景（投诉/反馈/转人工/FAQ指引）
 
 
 @dataclass
@@ -198,9 +199,9 @@ class RoutingDecision(BaseModel):
     使用Pydantic进行强类型约束和自动验证，替代手动JSON解析。
     提供更好的类型安全性和错误处理能力。
     """
-    route: Literal["agent", "rag", "chat", "reject"] = Field(
+    route: Literal["agent", "rag", "chat", "reject", "service"] = Field(
         ...,
-        description="路由类型：agent(商家查询), rag(知识问答), chat(闲聊), reject(拒绝)"
+        description="路由类型：agent(商家查询), rag(知识问答), chat(闲聊), reject(拒绝), service(客服场景)"
     )
     confidence: float = Field(
         ...,
@@ -216,7 +217,7 @@ class RoutingDecision(BaseModel):
     @field_validator('route')
     @classmethod
     def validate_route(cls, v: str) -> str:
-        valid_routes = {"agent", "rag", "chat", "reject"}
+        valid_routes = {"agent", "rag", "chat", "reject", "service"}
         if v not in valid_routes:
             raise ValueError(f"无效的路由类型: {v}，必须是 {valid_routes} 之一")
         return v
@@ -259,6 +260,50 @@ CHAT_KEYWORDS = frozenset({
 })
 
 REJECT_PATTERN = re.compile(r'^[\s\W]+$')  # 纯空白/符号/表情
+
+
+# Layer 1 新增：客服场景关键词（投诉/反馈/转人工/FAQ指引）
+SERVICE_KEYWORDS = frozenset({
+    # ---- 投诉/反馈 ----
+    "投诉", "举报", "反馈", "差评", "不满意",
+    "坑人", "骗人", "上当", "踩雷", "避雷",
+    # ---- 售后咨询 ----
+    "退款", "退券", "怎么退", "退不了",
+    "用不了", "不好使", "打不开",
+    "优惠券过期", "券不能用",
+    # ---- 转人工 ----
+    "人工客服", "转人工", "找客服", "找人工",
+    "真人", "客服电话", "联系电话", "打电话",
+    # ---- FAQ/使用指引 ----
+    "怎么用", "在哪看", "在哪里看", "怎么看",
+    "找不到", "没找到",
+    # ---- 账号问题 ----
+    "登录不了", "登不上", "注册", "密码",
+    "账号", "账户",
+})
+
+SERVICE_STRONG_KEYWORDS = frozenset({
+    "投诉", "人工客服", "转人工", "退款", "举报",
+})
+
+
+def _is_service(msg: str) -> Optional[RouteResult]:
+    """检查是否为客服场景输入"""
+    msg_stripped = msg.strip()
+    matched = [kw for kw in SERVICE_KEYWORDS if kw in msg_stripped]
+    if not matched:
+        return None
+
+    strong_count = sum(1 for kw in matched if kw in SERVICE_STRONG_KEYWORDS)
+    confidence = min(0.7 + strong_count * 0.1, 0.98)
+
+    return RouteResult(
+        route=RouteType.SERVICE,
+        confidence=confidence,
+        matched_keywords=matched,
+        layer_used=1,
+        reason=f"客服关键词({len(matched)}个): {', '.join(matched[:3])}"
+    )
 
 
 def _is_chat_or_reject(msg: str) -> Optional[RouteResult]:
@@ -616,10 +661,14 @@ def route_v2(
             reason="强制Chat模式"
         )
     
-    # ---- Layer 1: 预过滤（闲聊/拒绝）----
+    # ---- Layer 1: 预过滤（闲聊/拒绝/客服）----
     pre_filter_result = _is_chat_or_reject(msg)
     if pre_filter_result:
         return pre_filter_result
+
+    service_result = _is_service(msg)
+    if service_result:
+        return service_result
     
     CONFIDENCE_THRESHOLD = 0.6
     
@@ -780,13 +829,13 @@ ROUTING_TOOL_SCHEMA = {
     "function": {
         "name": "classify_intent",
         "description": "对用户的输入进行分类，判断应该路由到哪个处理模块。"
-                       "agent=商家/服务查询, rag=知识问答, chat=闲聊, reject=无效输入",
+                       "agent=商家/服务查询, rag=知识问答, chat=闲聊, reject=无效输入, service=客服投诉/转人工/FAQ指引",
         "parameters": {
             "type": "object",
             "properties": {
                 "route": {
                     "type": "string",
-                    "enum": ["agent", "rag", "chat", "reject"],
+                    "enum": ["agent", "rag", "chat", "reject", "service"],
                     "description": "路由类型"
                 },
                 "confidence": {

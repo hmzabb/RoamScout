@@ -301,7 +301,7 @@ def search_blogs(query: str) -> str:
 
 @tool
 def search_knowledge(query: str) -> str:
-    """搜索西安文旅知识（景点/美食/攻略等语料库）。
+    """搜索城市文旅知识（景点/美食/攻略等语料库）。
 
     【使用场景】✅ 必须在以下情况使用此工具：
     - 用户询问西安景点信息（大雁塔、兵马俑、城墙、华清宫等）
@@ -336,6 +336,132 @@ def search_knowledge(query: str) -> str:
     return _search_kb(query, where={"source": "corpus"})
 
 
+# ==================== 客服反馈工具（V3 新增） ====================
+
+@tool
+def submit_feedback(
+    feedback_type: str,
+    content: str,
+    shop_name: str = "",
+    request_id: str = "",
+) -> str:
+    """收集用户反馈/投诉/建议，记录到后台供运营团队查看处理。
+
+    【使用场景】✅ 必须在以下情况使用此工具：
+    - 用户明确表示要投诉某个店铺或服务
+    - 用户反映优惠券/团购使用问题（无法使用、过期等）
+    - 用户提出改进建议或功能需求
+    - 用户描述了不愉快的消费体验需要记录
+
+    【不要使用此工具的场景】❌ 以下情况请用其他工具：
+    - 用户只是问优惠券信息/库存 → 用 list_vouchers
+    - 用户问店铺基本信息 → 用 search_shops_by_name 或 get_shop_detail
+    - 用户问景点/攻略 → 用 search_knowledge
+
+    【参数说明】
+    feedback_type: 反馈类型（必填），可选值：
+      - "complaint": 投诉（服务差/质量问题/虚假宣传等）
+      - "voucher_issue": 优惠券问题（无法使用/过期/退款等）
+      - "suggestion": 建议（功能建议/体验优化等）
+      - "bug": 故障报告（页面打不开/显示异常等）
+      - "other": 其他问题
+
+    content: 反馈具体内容（必填），尽量详细描述问题
+      ⚠️ 不能为空，建议包含时间、地点、具体问题描述
+
+    shop_name: 关联店铺名称（可选），如果投诉涉及具体店铺则填写
+      - 如果用户提到了店名但你没查到shop_id，至少把店名传进来
+
+    request_id: 幂等请求ID（可选，系统会自动注入），用于下游去重
+      - 由 Policy Engine 生成并注入，模型无需填写
+      - 重试时携带同一 request_id，下游按此ID去重，避免重复提交
+
+    【返回示例】
+    {"success": true, "message": "反馈已记录，运营团队将尽快处理", "feedback_id": "fbk_xxx"}
+    """
+    # 第二层防御：参数校验
+    valid_types = {"complaint", "voucher_issue", "suggestion", "bug", "other"}
+    if feedback_type not in valid_types:
+        return _json({
+            "error": f"无效的反馈类型「{feedback_type}」，可选: {', '.join(sorted(valid_types))}",
+            "suggestion": "请使用正确的反馈类型"
+        })
+
+    if not content or len(content.strip()) < 2:
+        return _json({"error": "反馈内容不能为空或过短，请让用户详细描述问题"})
+
+    import uuid
+    import json as _json_module
+    from datetime import datetime, timezone, timedelta
+
+    # 第三层防御：幂等重放检查（按 request_id 去重）
+    # 下游按 request_id 识别同一笔操作，重试时直接返回上次结果，不会重复提交
+    if request_id:
+        try:
+            import redis
+            from app.config import settings as app_settings
+            _r = redis.Redis.from_url(
+                app_settings.redis_url,
+                password=app_settings.redis_password or None,
+                socket_connect_timeout=2,
+            )
+            cached = _r.get(f"feedback:req:{request_id}")
+            if cached:
+                logger.info(f"[Feedback] 幂等命中，重放上次结果: request_id={request_id}")
+                return cached.decode("utf-8") if isinstance(cached, bytes) else str(cached)
+        except Exception as e:
+            logger.warning(f"[Feedback] 幂等检查失败，继续执行: {e}")
+
+    # 防重复提交（相同内容短时间内不重复记录）
+    dup_error = ToolGuard.check_duplicate_call(
+        "submit_feedback",
+        {"feedback_type": feedback_type, "content": content[:50]}
+    )
+    if dup_error:
+        return _json({"error": dup_error})
+
+    feedback_id = f"fbk_{uuid.uuid4().hex[:12]}"
+    tz = timezone(timedelta(hours=8))
+    record = {
+        "feedback_id": feedback_id,
+        "feedback_type": feedback_type,
+        "content": content.strip(),
+        "shop_name": shop_name or "",
+        "request_id": request_id or "",
+        "created_at": datetime.now(tz).isoformat(),
+    }
+
+    result_payload = _json({
+        "success": True,
+        "message": "感谢您的反馈！我们已将问题记录下来，运营团队会尽快处理。",
+        "feedback_id": feedback_id,
+    })
+
+    try:
+        import redis
+        from app.config import settings as app_settings
+        r = redis.Redis.from_url(
+            app_settings.redis_url,
+            password=app_settings.redis_password or None,
+            socket_connect_timeout=2,
+        )
+        r.lpush("feedbacks:pending", _json_module.dumps(record, ensure_ascii=False))
+        r.expire("feedbacks:pending", 86400 * 30)  # 保留30天
+        # 写入幂等结果缓存，供重试时重放
+        if request_id:
+            r.set(f"feedback:req:{request_id}", result_payload, ex=300)
+        logger.info(f"[Feedback] 已记录: id={feedback_id}, type={feedback_type}")
+        return result_payload
+    except Exception as e:
+        logger.warning(f"[Feedback] Redis记录失败，仅返回确认: {e}")
+        return _json({
+            "success": True,
+            "message": "感谢您的反馈！我们已收到您的问题。",
+            "feedback_id": feedback_id,
+            "note": "记录异常，但已确认收到"
+        })
+
+
 ALL_TOOLS = [
     search_shops_by_name,
     list_shops_by_type,
@@ -343,4 +469,45 @@ ALL_TOOLS = [
     list_vouchers,
     search_blogs,
     search_knowledge,
+    submit_feedback,
 ]
+
+# ==================== 第一层：Schema 版本管理 ====================
+
+# 工具 Schema 版本号（与 config.py 中 tool_schema_version 对应）
+TOOL_SCHEMA_VERSION = "1.0.0"
+
+# 每个工具的版本记录（用于追溯 Schema 变更历史）
+TOOL_VERSIONS = {
+    "search_shops_by_name": "1.0.0",
+    "list_shops_by_type": "1.0.0",
+    "get_shop_detail": "1.0.0",
+    "list_vouchers": "1.0.0",
+    "search_blogs": "1.0.0",
+    "search_knowledge": "1.0.0",
+    "submit_feedback": "1.0.0",
+}
+
+# Schema 变更日志（按版本号记录每次变更）
+SCHEMA_CHANGELOG = {
+    "1.0.0": "初始版本：6个查询工具 + 1个反馈工具，完整的场景描述和参数校验"
+}
+
+
+def get_tool_schema_info() -> dict:
+    """获取当前工具 Schema 的完整信息（用于审计和版本追溯）。
+
+    Returns:
+        {
+            "schema_version": "1.0.0",
+            "tools": {"search_shops_by_name": "1.0.0", ...},
+            "changelog": {...},
+            "total_tools": 7,
+        }
+    """
+    return {
+        "schema_version": TOOL_SCHEMA_VERSION,
+        "tools": TOOL_VERSIONS,
+        "changelog": SCHEMA_CHANGELOG,
+        "total_tools": len(ALL_TOOLS),
+    }

@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="长安文旅探店助手 AI 服务", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="游探AI 服务", version="0.1.0", lifespan=lifespan)
 
 # Prometheus 指标采集：自动暴露 /metrics，覆盖 QPS/P50/P90/P99/错误率/请求大小
 Instrumentator().instrument(app).expose(app)

@@ -77,7 +77,7 @@ class ResultQualityChecker:
         ),
         "search_knowledge": (
             "\n\n💡 提示：知识库中没有找到相关信息。\n"
-            "   可能原因：问题太具体 / 超出西安文旅范围\n"
+            "   可能原因：问题太具体 / 超出当前城市文旅范围\n"
             "   建议：尝试更通用的关键词，或告诉用户暂时无法回答\n"
             "   ⚠️ 不要编造景点/攻略信息！如果确实不知道，就说不知道。"
         ),
@@ -286,19 +286,40 @@ class ParallelToolNode(ToolNode):
         if not last_message.tool_calls:
             return {"messages": []}
 
+        # 第四层：任务级总超时检查（wall-clock），已超时则直接拒绝执行
+        deadline = state.get("task_deadline")
+        if deadline and time.time() > deadline:
+            logger.warning(
+                f"[ParallelTool] 任务总超时({settings.max_task_duration_seconds}s)已耗尽，"
+                f"拒绝执行剩余 {len(last_message.tool_calls)} 个工具调用"
+            )
+            return {
+                "messages": [
+                    ToolMessage(
+                        content=json.dumps({
+                            "status": "DEADLINE_EXCEEDED",
+                            "retryable": False,
+                            "error": "任务总耗时已超出预算，工具未执行",
+                            "instruction": (
+                                "请不要再调用任何工具。基于已有信息直接回答用户，"
+                                "并说明部分信息因超时未能获取，建议用户稍后重试或转人工。"
+                            ),
+                        }, ensure_ascii=False),
+                        name=tc["name"],
+                        tool_call_id=tc["id"],
+                    )
+                    for tc in last_message.tool_calls
+                ]
+            }
+
         tool_calls = last_message.tool_calls
         num_calls = len(tool_calls)
 
         if num_calls == 1:
             # 单个工具调用：直接执行（无需并行开销）
             logger.debug(f"[ParallelTool] 单个工具调用: {tool_calls[0]['name']}")
-            result = await super().run(state, config)
-            # 单个工具也要做结果质量检查
-            if result["messages"]:
-                result["messages"][0] = self._apply_quality_check(
-                    result["messages"][0], tool_calls[0]
-                )
-            return result
+            single_msg = await self._execute_single_tool(tool_calls[0], config, state)
+            return {"messages": [self._apply_quality_check(single_msg, tool_calls[0])]}
 
         # 多个工具调用：并行执行
         logger.info(
@@ -310,7 +331,7 @@ class ParallelToolNode(ToolNode):
 
         # 创建异步任务列表
         tasks = [
-            self._execute_single_tool(tool_call, config)
+            self._execute_single_tool(tool_call, config, state)
             for tool_call in tool_calls
         ]
 
@@ -368,6 +389,17 @@ class ParallelToolNode(ToolNode):
             tool_args=tool_args
         )
 
+        # 第五层指标：空结果计入误触发信号
+        try:
+            from app.agent.tracer import get_metrics_collector
+            is_empty = ResultQualityChecker._is_empty_result(
+                tool_name, self._safe_parse(tool_message.content)
+            )
+            if is_empty:
+                get_metrics_collector().record_empty_result(tool_name)
+        except Exception:
+            pass
+
         # 返回新的ToolMessage（内容已增强）
         return ToolMessage(
             content=enhanced_content,
@@ -375,52 +407,228 @@ class ParallelToolNode(ToolNode):
             tool_call_id=tool_call["id"]
         )
 
+    @staticmethod
+    def _safe_parse(content: Any) -> Dict:
+        """尽力把工具返回内容解析为 dict，供空结果判定使用。"""
+        if isinstance(content, dict):
+            return content
+        try:
+            parsed = json.loads(content)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
     async def _execute_single_tool(
         self,
         tool_call: dict,
-        config: Optional[dict] = None
+        config: Optional[dict] = None,
+        state: Optional[dict] = None
     ) -> ToolMessage:
-        """执行单个工具调用（带超时控制）。
+        """执行单个工具调用（带超时分级 + 读操作快速重试 + 审计回填）。
+
+        超时分级（第三层安全治理）：
+        - 读操作超时：可快速重试（安全，无副作用）
+        - 写操作超时：标记 UNKNOWN 并禁止重试，提示先查状态
+          —— 绝不能告诉模型"失败可重试"，否则会重复扣款/下单
 
         Args:
             tool_call: 工具调用信息 {name, args, id}
             config: 运行配置
+            state: Agent 状态（用于总超时检查与重试计数）
 
         Returns:
             ToolMessage: 工具执行结果
         """
+        from app.agent.policy_engine import is_write_tool, get_policy_engine
+        from app.agent.tracer import get_metrics_collector
+
         tool_name = tool_call["name"]
         tool_args = tool_call.get("args", {})
         tool_id = tool_call["id"]
 
-        try:
-            # 查找工具函数
-            tool_func = self.tools_by_name.get(tool_name)
-            if not tool_func:
-                raise ValueError(f"未知工具: {tool_name}")
+        is_write = is_write_tool(tool_name)
+        request_id = tool_args.get("request_id") if is_write else None
 
-            # 带超时执行
-            result = await asyncio.wait_for(
-                self._run_tool_sync(tool_func, tool_args),
-                timeout=self.timeout_per_tool
-            )
+        # 超时分级：读操作 15s（可重试），写操作 30s（超时标记 UNKNOWN）
+        timeout = (
+            settings.write_tool_timeout_seconds if is_write
+            else settings.read_tool_timeout_seconds
+        )
+        timeout = min(timeout, self.timeout_per_tool)
 
-            return ToolMessage(
-                content=str(result),
-                name=tool_name,
-                tool_call_id=tool_id
-            )
+        engine = get_policy_engine()
+        metrics = get_metrics_collector()
 
-        except asyncio.TimeoutError:
-            logger.warning(f"[ParallelTool] 工具 {tool_name} 超时 ({self.timeout_per_tool}s)")
-            return ToolMessage(
-                content=f'{{"error": "工具 {tool_name} 执行超时({self.timeout_per_tool}s)，请稍后重试或换其他方式"}}',
-                name=tool_name,
-                tool_call_id=tool_id
-            )
-        except Exception as e:
-            logger.error(f"[ParallelTool] 工具 {tool_name} 异常: {e}")
-            raise
+        tool_func = self.tools_by_name.get(tool_name)
+        if not tool_func:
+            engine.record_execution_result(tool_name, request_id, "failed", "未知工具", 0.0)
+            raise ValueError(f"未知工具: {tool_name}")
+
+        start = time.time()
+        attempt = 0
+        max_attempts = 1 if is_write else (1 + settings.max_tool_retry_per_call)
+
+        while True:
+            attempt += 1
+            try:
+                result = await asyncio.wait_for(
+                    self._run_tool_sync(tool_func, tool_args),
+                    timeout=timeout
+                )
+                elapsed_ms = (time.time() - start) * 1000
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    duration_ms=elapsed_ms,
+                    success=True,
+                    retries=attempt - 1,
+                    is_write=is_write,
+                )
+                engine.record_execution_result(
+                    tool_name, request_id, "success", result, elapsed_ms
+                )
+                return ToolMessage(
+                    content=str(result),
+                    name=tool_name,
+                    tool_call_id=tool_id
+                )
+
+            except asyncio.TimeoutError:
+                elapsed_ms = (time.time() - start) * 1000
+
+                # 写操作超时：结果未知，禁止重试，必须查状态
+                if is_write:
+                    metrics.record_tool_call(
+                        tool_name=tool_name, duration_ms=elapsed_ms,
+                        success=False, retries=0, is_write=True, status="unknown",
+                    )
+                    engine.record_execution_result(
+                        tool_name, request_id, "unknown",
+                        f"写操作超时({timeout}s)，状态未知", elapsed_ms,
+                    )
+                    logger.warning(
+                        f"[ParallelTool] 写操作 {tool_name} 超时 ({timeout}s)，"
+                        f"标记 UNKNOWN，request_id={request_id}"
+                    )
+                    return ToolMessage(
+                        content=json.dumps({
+                            "status": "UNKNOWN",
+                            "retryable": False,
+                            "error": (
+                                f"工具 {tool_name} 执行超时({timeout}s)，"
+                                f"操作结果未知（可能已成功，也可能未执行）"
+                            ),
+                            "request_id": request_id,
+                            "instruction": (
+                                "⚠️ 禁止重试本操作。请如实告知用户：操作状态未知，"
+                                "系统正在核实；如需确认请让用户稍后查询或联系人工客服。"
+                                "绝对不要声称操作失败或让用户重新提交。"
+                            ),
+                        }, ensure_ascii=False),
+                        name=tool_name,
+                        tool_call_id=tool_id
+                    )
+
+                # 读操作超时：还有重试额度则快速重试
+                if attempt < max_attempts:
+                    logger.warning(
+                        f"[ParallelTool] 读操作 {tool_name} 超时 ({timeout}s)，"
+                        f"快速重试 {attempt}/{max_attempts - 1}"
+                    )
+                    if state is not None:
+                        counts = state.setdefault("tool_retry_count", {})
+                        counts[tool_name] = counts.get(tool_name, 0) + 1
+                    continue
+
+                # 读操作重试耗尽 → 失败退出（降级话术，不无限重试）
+                metrics.record_tool_call(
+                    tool_name=tool_name, duration_ms=elapsed_ms,
+                    success=False, retries=attempt - 1, is_write=False, status="timeout",
+                )
+                engine.record_execution_result(
+                    tool_name, request_id, "timeout",
+                    f"读操作重试 {attempt - 1} 次后仍超时", elapsed_ms,
+                )
+                logger.error(
+                    f"[ParallelTool] 读操作 {tool_name} 重试耗尽 "
+                    f"({attempt - 1}次)，降级返回"
+                )
+                return ToolMessage(
+                    content=json.dumps({
+                        "status": "TIMEOUT",
+                        "retryable": False,
+                        "error": f"工具 {tool_name} 多次重试({attempt - 1}次)后仍超时",
+                        "instruction": (
+                            "请不要再重试本工具。基于已知信息回答用户，"
+                            "并说明该部分数据暂时无法获取，建议稍后再试或转人工。"
+                        ),
+                    }, ensure_ascii=False),
+                    name=tool_name,
+                    tool_call_id=tool_id
+                )
+
+            except Exception as e:
+                elapsed_ms = (time.time() - start) * 1000
+
+                # 写操作异常：同样可能是"已执行但响应丢失"，标记 UNKNOWN
+                if is_write:
+                    metrics.record_tool_call(
+                        tool_name=tool_name, duration_ms=elapsed_ms,
+                        success=False, retries=0, is_write=True, status="unknown",
+                    )
+                    engine.record_execution_result(
+                        tool_name, request_id, "unknown", f"写操作异常: {e}", elapsed_ms,
+                    )
+                    logger.error(
+                        f"[ParallelTool] 写操作 {tool_name} 异常: {e}，"
+                        f"标记 UNKNOWN，request_id={request_id}"
+                    )
+                    return ToolMessage(
+                        content=json.dumps({
+                            "status": "UNKNOWN",
+                            "retryable": False,
+                            "error": f"工具 {tool_name} 执行异常，结果未知: {e}",
+                            "request_id": request_id,
+                            "instruction": (
+                                "⚠️ 禁止重试本操作。请如实告知用户操作状态未知、"
+                                "系统正在核实，不要让用户重新提交。"
+                            ),
+                        }, ensure_ascii=False),
+                        name=tool_name,
+                        tool_call_id=tool_id
+                    )
+
+                # 读操作异常：可重试则重试
+                if attempt < max_attempts:
+                    logger.warning(
+                        f"[ParallelTool] 读操作 {tool_name} 异常: {e}，"
+                        f"快速重试 {attempt}/{max_attempts - 1}"
+                    )
+                    if state is not None:
+                        counts = state.setdefault("tool_retry_count", {})
+                        counts[tool_name] = counts.get(tool_name, 0) + 1
+                    continue
+
+                metrics.record_tool_call(
+                    tool_name=tool_name, duration_ms=elapsed_ms,
+                    success=False, retries=attempt - 1, is_write=False, status="failed",
+                )
+                engine.record_execution_result(
+                    tool_name, request_id, "failed", str(e), elapsed_ms
+                )
+                logger.error(f"[ParallelTool] 工具 {tool_name} 异常（重试耗尽）: {e}")
+                return ToolMessage(
+                    content=json.dumps({
+                        "status": "FAILED",
+                        "retryable": False,
+                        "error": f"工具 {tool_name} 执行失败: {e}",
+                        "instruction": (
+                            "请不要再重试本工具。基于已知信息回答用户，"
+                            "并说明该部分数据暂时无法获取，建议转人工。"
+                        ),
+                    }, ensure_ascii=False),
+                    name=tool_name,
+                    tool_call_id=tool_id
+                )
 
     async def _run_tool_sync(self, tool_func, tool_args: dict) -> Any:
         """在线程池中执行同步工具函数。

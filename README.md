@@ -1,9 +1,9 @@
-<h1 align="center">🏮 长安文旅探店助手</h1>
+<h1 align="center">🔍 游探AI / RoamScout</h1>
 
 <p align="center">
   <strong>Java + Python 双栈 AI 探店平台</strong><br>
   以 Spring Boot 点评平台为底座，叠加 DeepSeek 大模型 + LangGraph Agent + Milvus 向量检索<br>
-  打造长安（西安）文旅场景下的智能问答、探店笔记 AI 辅助与智能推荐 Agent
+  打造城市文旅场景下的智能问答、探店笔记 AI 辅助与智能推荐 Agent
 </p>
 
 <p align="center">

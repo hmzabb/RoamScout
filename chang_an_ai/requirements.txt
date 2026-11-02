@@ -1,4 +1,4 @@
-# 长安文旅探店助手 - Python AI 服务依赖（简化版 - C端优化）
+# 游探AI - Python AI 服务依赖（简化版 - C端优化）
 # Python 3.11+ | 更新日期: 2026-10-02
 
 # Web框架（自动解决版本兼容性）
@@ -19,6 +19,7 @@ langchain-text-splitters>=1.1.0
 
 # 向量库 & Embedding
 pymilvus>=3.0.0
+numpy>=1.24.0
 
 # HTTP & 配置
 httpx>=0.27.0
