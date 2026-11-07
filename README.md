@@ -23,6 +23,27 @@
 
 ---
 
+## 📖 目录
+
+- [✨ 核心亮点](#-核心亮点)
+- [🚀 快速开始](#-快速开始)
+  - [环境要求](#环境要求)
+  - [启动步骤](#启动步骤)
+- [🏗 系统架构](#-系统架构)
+- [🛠 技术栈](#-技术栈)
+- [📂 项目结构](#-项目结构)
+- [📡 接口设计](#-接口设计)
+- [🧠 核心功能概览](#-核心功能概览)
+- [📊 性能指标](#-性能指标)
+- [🗺 意图路由版本演进](#-意图路由版本演进)
+- [🧪 测试体系](#-测试体系)
+- [🤝 贡献指南](#-贡献指南)
+- [❓ 常见问题 FAQ](#-常见问题-faq)
+- [📄 License](#-license)
+- [🙏 致谢](#-致谢)
+
+---
+
 ## ✨ 核心亮点
 
 | 功能 | 简介 | 示例对话 |
@@ -35,6 +56,38 @@
 | ✍️ **笔记 AI 辅助** | 一键生成标题（5选1）、风格润色、情感分析自检 | 文艺 / 幽默 / 朴实三种风格 |
 | 📊 **路由监控系统** | 实时统计、异常检测、报告导出，持续优化准确率 | `/api/ai/routing/stats` 查看统计 |
 | 🧪 **专业评估体系** | RAG 检索评估(Hit@3=90.5%) + RAGAS 跨家族评分 + 路由V2评估(300用例) | `python scripts/eval_ragas.py` |
+
+---
+
+## 🚀 快速开始
+
+### 环境要求
+- Java 17+ / Python 3.11 / MySQL 8.0 / Redis 7.x / Docker (Milvus) / nginx 1.18
+
+### 启动步骤
+
+```bash
+# 1️⃣ 启动基础设施 (MySQL, Redis, Milvus)
+docker start milvus-standalone
+
+# 2️⃣ 启动 Python AI 服务
+cd chang_an_ai
+pip install -r requirements.txt
+cp .env.example .env  # 配置 API Key
+python scripts/ingest.py  # 构建知识库
+python run.py            # 启动服务 (:8000)
+
+# 3️⃣ 启动 Java 后端
+cd chang_an_backend/chang_an_dianping
+mvn spring-boot:run  # 启动服务 (:8081)
+
+# 4️⃣ 启动 nginx 网关
+cd chang_an_backend/nginx-1.18.0
+start nginx.exe
+
+# 5️⃣ 打开浏览器访问
+open http://localhost:8080
+```
 
 ---
 
@@ -155,6 +208,9 @@ docker-compose -f docker-compose.monitoring.yml up -d  # Prometheus :9090 + Graf
 
 ## 📂 项目结构
 
+<details>
+<summary>📁 点击展开/收起项目目录树</summary>
+
 ```
 chang_an_travel/
 ├── chang_an_ai/                    # Python AI 服务 (FastAPI :8000)
@@ -218,37 +274,7 @@ chang_an_travel/
     └── nginx-1.18.0/             # 网关 (:8080)
 ```
 
----
-
-## 🚀 快速开始
-
-### 环境要求
-- Java 17+ / Python 3.11 / MySQL 8.0 / Redis 7.x / Docker (Milvus) / nginx 1.18
-
-### 启动步骤
-
-```bash
-# 1️⃣ 启动基础设施 (MySQL, Redis, Milvus)
-docker start milvus-standalone
-
-# 2️⃣ 启动 Python AI 服务
-cd chang_an_ai
-pip install -r requirements.txt
-cp .env.example .env  # 配置 API Key
-python scripts/ingest.py  # 构建知识库
-python run.py            # 启动服务 (:8000)
-
-# 3️⃣ 启动 Java 后端
-cd chang_an_backend/chang_an_dianping
-mvn spring-boot:run  # 启动服务 (:8081)
-
-# 4️⃣ 启动 nginx 网关
-cd chang_an_backend/nginx-1.18.0
-start nginx.exe
-
-# 5️⃣ 打开浏览器访问
-open http://localhost:8080
-```
+</details>
 
 ---
 
@@ -575,10 +601,83 @@ python scripts/comprehensive_perf_cost_test.py   # 性能与成本分析
 
 ---
 
+## 🤝 贡献指南
+
+本项目为个人学习项目，但欢迎提出建议和反馈！
+
+### 如何贡献
+
+1. **Fork** 本仓库
+2. 创建特性分支：`git checkout -b feature/amazing-feature`
+3. 提交更改：`git commit -m 'feat: add amazing feature'`
+4. 推送到分支：`git push origin feature/amazing-feature`
+5. 提交 **Pull Request**
+
+### 提交规范
+
+本项目推荐使用 [Conventional Commits](https://www.conventionalcommits.org/) 规范：
+
+- `feat`: 新功能
+- `fix`: Bug 修复
+- `docs`: 文档更新
+- `test`: 测试相关
+- `refactor`: 代码重构
+- `style`: 代码格式调整
+- `perf`: 性能优化
+
+### 代码风格
+
+- **Python**: 遵循 [PEP 8](https://peps.python.org/pep-0008/) 规范
+- **Java**: 遵循阿里巴巴 Java 开发手册
+
+---
+
+## ❓ 常见问题 FAQ
+
+### Q1: 为什么使用两个技术栈（Java + Python）？
+
+Java 负责传统业务（店铺、用户、优惠券、秒杀），Python 负责 AI 能力（RAG、Agent、NLP）。这种设计遵循「关注点分离」原则，各自发挥语言优势。
+
+### Q2: 如何在没有 GPU 的情况下运行本项目？
+
+本项目所有 AI 推理（DeepSeek、Embedding、Reranker）均通过云 API 调用，本地仅运行服务编排层，无需 GPU。
+
+### Q3: Milvus 向量库为什么选择 Docker 部署？
+
+Milvus 官方推荐 Docker Compose 方式部署，且本项目的知识库规模（41 篇文档）用 Milvus Standalone 模式即可满足，无需部署 K8s 集群。
+
+### Q4: RAG 的 Fallback 率 24.3% 是否可优化？
+
+24.3% 的 Fallback 率已从最初的 60.8% 大幅优化，剩余部分主要源于语料库覆盖度不足（如特定小众景点未收录）。可继续扩充语料库来提升覆盖率。
+
+### Q5: 要接入其他大模型（如 GPT-4、Claude）怎么做？
+
+修改 `chang_an_ai/.env` 中的 API 配置，以及 `app/config.py` 中的模型名称即可。本项目已封装统一的 LLM 调用接口。
+
+### Q6: 为什么路由选择四层架构而非纯 LLM 路由？
+
+纯 LLM 路由（如 V4.0-V6.0 探索的）需要 250MB 常驻内存 + 50-850ms 延迟，而四层架构规则层 <2ms + LLM 仅兜底 2% 请求，兼顾性能与准确率。
+
+---
+
 ## 📄 License
 
 MIT License © 2024-2026
 
-**⭐ 如果这个项目对你有帮助，欢迎 Star 支持！**
-
 ---
+
+## 🙏 致谢
+
+本项目在开发和调研过程中，参考和借鉴了以下优秀开源项目和资源：
+
+- **[LangChain](https://github.com/langchain-ai/langchain)** — LLM 应用开发框架
+- **[LangGraph](https://github.com/langchain-ai/langgraph)** — Agent 状态图编排
+- **[Milvus](https://github.com/milvus-io/milvus)** — 向量数据库
+- **[FastAPI](https://github.com/tiangolo/fastapi)** — 高性能 Python Web 框架
+- **[Spring Boot](https://github.com/spring-projects/spring-boot)** — Java 企业级框架
+- **[BGE-M3](https://huggingface.co/BAAI/bge-m3)** — 多语言 Embedding 模型
+- **[DeepSeek](https://github.com/deepseek-ai)** — 深度求索大模型
+- **[RAGAS](https://github.com/explodinggradients/ragas)** — RAG 评估框架
+- **[Redis](https://github.com/redis/redis)** — 高性能缓存与消息队列
+
+**⭐ 如果这个项目对你有帮助，欢迎 Star 支持！**

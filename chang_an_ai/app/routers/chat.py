@@ -35,6 +35,8 @@ import time
 from datetime import datetime
 from typing import Optional
 
+from langchain_openai import ChatOpenAI
+import httpx
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -43,7 +45,7 @@ from app.agent.graph import get_agent, RECURSION_LIMIT
 from app.services import rag_service
 from app.services.session_store import append_with_summary, get_history, append
 from app.config import settings
-from app.routing_config_v2 import route_v2, RouteType  # ✅ 使用V2路由
+from app.routing_config_v2 import route_v2, RouteType, RouteResult  # ✅ 使用V2路由
 from app.routing_monitor import get_routing_monitor
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,7 @@ def _sse(event: str, data) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def _route(req: ChatRequest) -> str:
+async def _route(req: ChatRequest) -> RouteResult:
     """V2增强版意图路由（99%准确率，支持上下文/Chat/Reject）。
 
     路由策略（V2升级版）：
@@ -98,7 +100,7 @@ async def _route(req: ChatRequest) -> str:
         f"reason={result.reason}"
     )
     
-    return result.route.value
+    return result  # V3: 返回完整RouteResult，支持多意图检测
 
 
 # =============================================================================
@@ -143,89 +145,95 @@ async def _handle_reject_mode(req: ChatRequest):
     yield _sse("done", {})
 
 
-# =============================================================================
-# V3 新增：客服模式
-# =============================================================================
-SERVICE_RESPONSES = {
-    "人工": "好的，为您转接人工客服。您可以通过以下方式联系我们的客服团队：\n"
-            "📞 请在游探APP内「我的」→「联系客服」查看客服热线\n"
-            "💬 APP内也有在线客服入口，可以直接对话哦～\n\n"
-            "如果您想先让我再试试帮您解决问题，也可以继续向我提问！",
 
-    "投诉": "非常抱歉给您带来了不好的体验！我已将您的问题记录下来，运营团队会尽快核实处理。\n\n"
-            "为了更好地帮您跟进，能否告诉我：\n"
-            "1. 是哪家店铺？（店名）\n"
-            "2. 具体遇到了什么问题？\n"
-            "3. 大概是什么时间发生的？\n\n"
-            "您也可以直接在APP内联系客服加速处理。",
+#===========================================================================
+# V3 升级：LLM 客服 Agent（Phase 1 优化）
+#===========================================================================
 
-    "优惠券": "关于优惠券使用的问题，建议您：\n"
-              "1. 先检查券的有效期是否过期\n"
-              "2. 确认使用条件（满减门槛、适用店铺等）\n"
-              "3. 如仍有问题，可以在APP「我的优惠券」内查看详细规则\n"
-              "4. 需要帮助可联系在线客服\n\n"
-              "您也可以让我帮您查一下具体店铺的优惠券信息，告诉我店名就好～",
+SERVICE_AGENT_PROMPT = """你是游探AI的客服专员，处理服务咨询、投诉、退款、优惠券等问题。
 
-    "退款": "关于退款问题：\n"
-            "1. 未使用的优惠券一般支持退款，请在APP「我的优惠券」内操作\n"
-            "2. 已使用的券不支持退款\n"
-            "3. 如遇异常情况，请联系在线客服处理\n\n"
-            "需要我帮您查具体哪家店的优惠券信息吗？",
+    回答要求：
+    - 语气亲切专业，像真人客服
+    - 用简洁的要点帮助用户
+    - 不要提及你是AI/大语言模型/机器人
 
-    "default": "你好！我是游探AI，可以帮你：\n"
-               "🔍 搜索店铺和优惠信息\n"
-               "📍 推荐附近好吃好玩的地方\n"
-               "📖 查询景点攻略和文化知识\n"
-               "🎫 了解优惠券和团购活动\n\n"
-               "如需人工客服，请说「转人工」或「找客服」～",
-}
+    处理指南：
+    - 转人工/找客服/找人工/人工客服/真人 → 引导APP内「我的-联系客服」
+    - 投诉 → 先道歉，收集关键信息（店铺名、问题、时间）
+    - 退款 → 引导APP我的优惠券内操作退款流程
+    - 优惠券 → 解释有效期限制，检查是否符合条件
+    - 其他 → 引导描述问题细节或建议联系客服
+"""
 
 
 def _match_service_category(msg: str) -> str:
-    """匹配客服场景子类别，返回对应的回复模板key"""
+    """匹配客服需求子类别"""
     msg_clean = msg.strip()
-    if any(kw in msg_clean for kw in ["转人工", "找客服", "找人工", "人工客服", "真人"]):
+    if any(kw in msg_clean for kw in ["转人工", "找客服", "找人工", "人工客服", "真人", "人工"]):
         return "人工"
-    if any(kw in msg_clean for kw in ["投诉", "举报", "坑人", "骗人", "踩雷", "避雷"]):
-        return "投诉"
-    if any(kw in msg_clean for kw in ["退款", "退券", "怎么退", "退不了"]):
+    if any(kw in msg_clean for kw in ["退款", "退票", "退货"]):
         return "退款"
-    if any(kw in msg_clean for kw in ["券不能用", "用不了", "不好使", "优惠券过期", "打不开"]):
+    if any(kw in msg_clean for kw in ["投诉", "举报", "控告"]):
+        return "投诉"
+    if any(kw in msg_clean for kw in ["优惠券", "代金券", "红包", "券"]):
         return "优惠券"
-    return "default"
-
+    if any(kw in msg_clean for kw in ["强制", "霸凌", "欺压", "坑"]):
+        return "投诉"
+    return "通用"
 
 async def _handle_service_mode(req: ChatRequest):
-    """处理客服模式（V3新增）：投诉安抚、转人工引导、FAQ指引。
-
-    分为两类场景：
-    1. 简单咨询（FAQ/转人工）→ 模板快速回复，不吃 Agent 延迟
-    2. 复杂投诉（需查店铺+收集信息）→ 路由到 Agent 模式处理
-    """
+    """LLM 客服 Agent：识别类别、区分投诉类/通用类"""
     category = _match_service_category(req.message)
 
-    # 需要 Agent 深度处理的场景：涉及具体店铺的投诉
+    # 投诉类 → Agent 路由（需要完整上下文和工具）
     if category == "投诉":
-        # 检查是否提到了具体店铺（需要Agent查店铺信息+收集反馈）
-        shop_keywords = ["店", "餐厅", "火锅", "美食", "酒吧", "KTV", "酒店"]
-        has_shop = any(kw in req.message for kw in shop_keywords)
-        if has_shop:
-            # 路由到Agent处理（Agent能查到店铺信息+调用submit_feedback）
-            logger.info(f"[Service] 投诉涉及具体店铺，路由到Agent: '{req.message[:30]}...'")
-            gen = _agent_frames(req, get_history(req.session_id))
-            async for frame in gen:
-                yield frame
-            return
+        history = get_history(req.session_id)
+        gen = _agent_frames(req, history, None)
+        async for frame in gen:
+            yield frame
+        return
 
-    # 其他场景：模板快速回复
-    response = SERVICE_RESPONSES.get(category, SERVICE_RESPONSES["default"])
+    # 通用类 → 轻量 LLM 专业回答（低温度 0.3，max_tokens 200）
+    try:
+        history = get_history(req.session_id)
+        recent = history[-4:] if len(history) > 4 else history
+        htext = chr(10).join([f"{m['role']}: {m['content']}" for m in recent])
 
-    yield _sse("status", {"message": "正在处理..."})
-    await asyncio.sleep(0.1)
-    yield _sse("delta", response)
-    yield _sse("done", {})
+        client = ChatOpenAI(
+            model=settings.deepseek_model,
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            temperature=0.3,
+            max_tokens=200,
+            timeout=15,
+            max_retries=1,
+        )
 
-    append(req.session_id, "assistant", response)
+        msgs = [
+            {"role": "system", "content": SERVICE_AGENT_PROMPT},
+            {"role": "user", "content": f"对话历史:\n{htext}\n\n用户消息: {req.message}\n客服类别: {category}\n请回复: "}
+        ]
+        resp = await client.ainvoke(msgs)
+        text = resp.content.strip() or "你好！有什么可以帮你的？"
+
+        yield _sse("status", {"message": "正在处理..."})
+        yield _sse("delta", text)
+        yield _sse("done", {})
+        append(req.session_id, "assistant", text)
+
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"[Service Agent] LLM 调用失败，降级为模板: {e}")
+        # 降级模板
+        fallback = {
+            "人工": "请在APP内「我的-联系客服」查看官方客服热线~",
+            "退款": "未使用的优惠券可在APP「我的优惠券」内操作退款哦~",
+            "优惠券": "请检查优惠券的有效期和使用条件，如有疑问请联系客服~",
+        }.get(category, "你好！如需人工客服，请在APP内「我的-联系客服」查看~")
+        yield _sse("delta", fallback)
+        yield _sse("done", {})
+        append(req.session_id, "assistant", fallback)
 
 
 async def _rag_frames(req: ChatRequest, history: list[dict]):
@@ -282,53 +290,46 @@ async def _rag_frames(req: ChatRequest, history: list[dict]):
         append(req.session_id, "assistant", "".join(collected))
 
 
-async def _agent_frames(req: ChatRequest, history: list[dict]):
-    """Agent 模式（async）：astream_events v2 流式。
+async def _agent_frames(req: ChatRequest, history: list[dict], route_result=None):
+    """Agent 模式（Phase 2 多 Agent 架构）。
 
-    messages 用 (role, content) 元组序列——LangGraph 会自动转成 BaseMessage。
+    Phase 2 改造：使用 MultiAgentCoordinator 替代单体 Agent：
+    - 单意图 → 选一个专业化子 Agent（shop/voucher/blog/knowledge）
+    - 多意图 → 主 Agent 流式 + 辅 Agent 后台并行 → 结果合并
+
     history 已含本轮用户消息（chat() 里先 append）。
-    
-    V3 五层防御：内置 TraceContext 串联全链路。
     """
+    from app.agent.multi_agent import get_coordinator
+
     messages = [(m["role"], m["content"]) for m in history]
+    coordinator = get_coordinator()
+
     collected: list[str] = []
 
-    # ==================== 第五层：创建 TraceContext ====================
-    from app.agent.tracer import TraceContext
-    from app.config import settings as app_settings
+    try:
+        async for ev in coordinator.run(messages, route_result, stream=True):
+            if ev["event"] == "delta":
+                collected.append(ev["data"])
+                yield _sse("delta", ev["data"])
+            elif ev["event"] == "tool_call":
+                yield _sse("tool_call", ev["data"])
+            elif ev["event"] == "done":
+                meta = ev.get("data", {})
+                yield _sse("done", meta)
+            elif ev["event"] == "multi_answer":
+                data = ev.get("data", {})
+                text = data.get("text", "")
+                if text:
+                    collected.append(text)
+                    yield _sse("delta", "\n\n" + text)
+                yield _sse("done", {"multi_intent": True, "secondary_count": data.get("secondary_count", 0)})
+            elif ev["event"] in ("error",):
+                yield _sse("error", ev.get("data", {}))
+    except Exception as e:
+        yield _sse("error", {"message": f"Agent 出错: {e}"})
 
-    with TraceContext(session_id=req.session_id, user_query=req.message) as trace_ctx:
-        trace_id = trace_ctx.trace_id
-
-        try:
-            config = {
-                "recursion_limit": RECURSION_LIMIT,
-                "configurable": {
-                    "session_id": req.session_id,
-                    "trace_id": trace_id,
-                }
-            }
-            async for ev in get_agent().astream_events(
-                {"messages": messages, "session_id": req.session_id, "trace_id": trace_id},
-                version="v2",
-                config=config,
-            ):
-                kind = ev["event"]
-                if kind == "on_chat_model_stream":
-                    chunk = ev["data"]["chunk"]
-                    if chunk.content:
-                        collected.append(chunk.content)
-                        yield _sse("delta", chunk.content)
-                elif kind == "on_tool_start":
-                    yield _sse("tool_call", {"name": ev["name"], "input": ev["data"].get("input")})
-        except Exception as e:
-            yield _sse("error", {"message": f"Agent 出错: {e}"})
-
-        if not collected:
-            yield _sse("delta", "抱歉，暂时没能查到结果，可以换个说法再试试～")
-
-        # 将 trace_id 发送给前端（方便联调和问题排查）
-        yield _sse("done", {"trace_id": trace_id})
+    if not collected:
+        yield _sse("delta", "抱歉，暂时没能查到结果，可以换个说法再试试～")
 
 
 @router.get("/routing/stats")
@@ -394,7 +395,6 @@ async def export_routing_report(format: str = "json"):
     )
 
 
-@router.post("/chat")
 async def chat(req: ChatRequest):
     """V3聊天接口主入口（支持agent/rag/chat/reject/service五种模式，集成五层防御体系）。
 
@@ -410,30 +410,34 @@ async def chat(req: ChatRequest):
 
     route_result = await _route(req)
 
+    route_val = route_result.route.value
+
     logger.info(
         f"[ChatV3] session={req.session_id[:8]}... "
-        f"mode={req.mode} route={route_result} "
-        f"msg='{req.message[:30]}...'"
+        f"mode={req.mode} route={route_val} conf={route_result.confidence:.2f} "
+        f"multi={route_result.is_multi_intent} msg='{req.message[:30]}...'"
     )
 
-    if route_result == "agent":
-        gen = _agent_frames(req, history)
+    if route_val == "agent":
+        gen = _agent_frames(req, history, route_result)
         headers = {"X-Route": "agent"}
-    elif route_result == "rag":
+    elif route_val == "rag":
         gen = _rag_frames(req, history)
         headers = {"X-Route": "rag"}
-    elif route_result == "chat":
+    elif route_val == "chat":
         gen = _handle_chat_mode(req)
         headers = {"X-Route": "chat"}
-    elif route_result == "reject":
+    elif route_val == "reject":
         gen = _handle_reject_mode(req)
         headers = {"X-Route": "reject"}
-    elif route_result == "service":
+    elif route_val == "service":
         gen = _handle_service_mode(req)
         headers = {"X-Route": "service"}
     else:
         gen = _rag_frames(req, history)  # 兜底
         headers = {"X-Route": "rag-fallback"}
+
+    # Phase 2: 多意图由 MultiAgentCoordinator 原生处理，无需额外包装
 
     headers.update({
         "Cache-Control": "no-cache",

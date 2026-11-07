@@ -191,6 +191,8 @@ class RouteResult:
     matched_keywords: List[str]
     layer_used: int  # 1=预过滤, 2=规则, 3=上下文
     reason: str
+    secondary_intents: List[Dict] = field(default_factory=list)  # V3: 多意图
+    is_multi_intent: bool = False  # V3: 多意图标记
 
 
 class RoutingDecision(BaseModel):
@@ -614,6 +616,62 @@ def _get_last_route_from_history(history: Optional[List[dict]]) -> Optional[str]
     return None
 
 
+
+
+def _detect_multi_intent(msg: str, agent_matched: List[str], rag_matched: List[str]) -> Tuple[bool, List[Dict]]:
+    """V3: 多意图检测 —— 通过句子分割 + 关键词归属分析识别复合意图。
+
+    当同一消息的不同分句命中不同意图类型时标记为多意图。
+    例如: "附近有什么好吃的？大雁塔门票多少钱？"
+    -> 分句1含"好吃的/附近"->Agent, 分句2含"大雁塔/门票"->RAG -> 多意图
+
+    Returns:
+        (is_multi, secondary): 是否多意图 + 次要意图列表
+    """
+    if not (agent_matched and rag_matched):
+        return False, []
+
+    SENTENCE_SPLITTERS = re.compile(r'[\u3002\uff01\uff1f!?\uff1b\uff1b\u2192\n,\uff0c]+')
+
+    segments = [s.strip() for s in SENTENCE_SPLITTERS.split(msg) if len(s.strip()) >= 4]
+
+    if len(segments) <= 1:
+        return False, []
+
+    segment_types = []
+    for seg in segments:
+        has_agent = any(kw in seg for kw in agent_matched)
+        has_rag = any(kw in seg for kw in rag_matched)
+
+        if has_agent and has_rag:
+            agent_count = sum(1 for kw in agent_matched if kw in seg)
+            rag_count = sum(1 for kw in rag_matched if kw in seg)
+            if agent_count > rag_count:
+                segment_types.append(("agent", seg))
+            elif rag_count > agent_count:
+                segment_types.append(("rag", seg))
+            else:
+                segment_types.append(("mixed", seg))
+        elif has_agent:
+            segment_types.append(("agent", seg))
+        elif has_rag:
+            segment_types.append(("rag", seg))
+        else:
+            segment_types.append(("other", seg))
+
+    unique_types = set(t for t, _ in segment_types if t not in ("other", "mixed"))
+
+    if len(unique_types) >= 2:
+        main_type = next(t for t, _ in segment_types if t not in ("other", "mixed"))
+        secondary = [
+            {"route": t, "segment": s}
+            for t, s in segment_types
+            if t not in ("other", "mixed") and t != main_type
+        ]
+        return True, secondary
+
+    return False, []
+
 # =============================================================================
 # 主路由函数
 # =============================================================================
@@ -772,6 +830,11 @@ def route_v2(
             layer_used=2,
             reason=f"冲突解决:{resolution_reason}"
         )
+        # V3: 多意图检测
+        is_multi, secondary = _detect_multi_intent(msg, agent_matched, rag_matched)
+        if is_multi:
+            rule_result.is_multi_intent = True
+            rule_result.secondary_intents = secondary
         # P0: 冲突解决后置信度仍低，交给LLM判断
         if confidence < CONFIDENCE_THRESHOLD:
             llm_fallback = _try_llm_fallback(msg, rule_result.route, confidence, rule_result.reason)

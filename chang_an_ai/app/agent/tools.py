@@ -462,6 +462,226 @@ def submit_feedback(
         })
 
 
+# ==================== 天气查询（和风天气 API） ====================
+
+@tool
+def query_weather(city: str = "西安", date: str = "today") -> str:
+    """查询城市天气（实时天气 + 3天预报 + 穿衣建议）。
+
+    【使用场景】✅ 必须在以下情况使用此工具：
+    - 用户问天气（今天/明天/未来天气如何）
+    - 用户问"下雨吗"、"冷不冷"、"要带伞吗"、"穿什么衣服"
+    - 用户做出行计划需要参考天气（如"明天去兵马俑，天气怎么样"）
+    - 用户提到户外活动需要天气信息
+
+    【不要使用此工具的场景】❌ 以下情况请用其他工具：
+    - 用户问景点信息/门票/攻略 → 用 search_knowledge 或 query_attraction
+    - 用户问店铺/美食 → 用 search_shops_by_name 或 list_shops_by_type
+
+    【参数说明】
+    city: 城市名（可选，默认"西安"）
+      - 支持：西安、咸阳、宝鸡、渭南、汉中、延安等
+      - ⚠️ 如果用户没有指定城市，默认用"西安"
+
+    date: 日期（可选，默认"today"）
+      - "today": 今天天气 + 3天预报
+      - 具体日期如"2026-11-09"：查询该日天气
+      ⚠️ 只能查询7天内的天气
+
+    【返回示例】
+    {"city": "西安", "current": {"temp": "15", "text": "晴", ...}, "forecast": [...], "dress_suggestion": "建议穿薄外套"}
+
+    【典型使用示例】
+    用户："今天西安天气怎么样？" → query_weather(city="西安", date="today")
+    用户："明天去兵马俑要带伞吗？" → query_weather(city="西安", date="tomorrow")
+    用户："华山今天冷不冷？" → query_weather(city="渭南", date="today")
+    """
+    error = ToolGuard.validate_search_query(city)
+    if error:
+        logger.warning(f"[ToolGuard] query_weather city参数被拦截: {error}")
+        return _json({"error": error})
+
+    dup_error = ToolGuard.check_duplicate_call(
+        "query_weather", {"city": city, "date": date}
+    )
+    if dup_error:
+        return _json({"error": dup_error})
+
+    try:
+        from app.services.weather_service import format_weather_for_agent
+
+        result = format_weather_for_agent(city=city, date=date)
+        return result
+    except Exception as e:
+        logger.error(f"[query_weather] 天气查询异常: {e}")
+        return _json({"error": f"天气查询失败: {e}，请稍后重试"})
+
+
+# ==================== 景点百科（高德POI + Milvus + 预设数据） ====================
+
+@tool
+def query_attraction(name: str, info_type: str = "overview") -> str:
+    """查询景点百科信息（门票/开放时间/攻略/交通/历史文化）。
+
+    【使用场景】✅ 必须在以下情况使用此工具：
+    - 用户询问某个景点的详细信息（门票价格、开放时间、地址、怎么去等）
+    - 用户比较多个景点需要详细数据对比
+    - 用户问"XX景点值得去吗"、"XX景点好玩吗"
+    - 用户问某景点的历史文化背景
+    - 用户做行程规划需要景点具体信息
+
+    【不要使用此工具的场景】❌ 以下情况请用其他工具：
+    - 用户问一般性的旅游攻略 → 用 search_knowledge（知识库更全面）
+    - 用户问景点周边的店铺/美食 → 用 search_shops_by_name 或 list_shops_by_type
+    - 用户问景点相关的用户评价/笔记 → 用 search_blogs
+
+    【参数说明】
+    name: 景点名称（必填）
+      - 如"兵马俑"、"大雁塔"、"城墙"、"华清宫"、"华山"、"钟楼"、"回民街"、"大唐不夜城"等
+      - ⚠️ 不能为空，建议使用标准景点名
+
+    info_type: 信息类型（可选，默认"overview"）
+      - "overview": 综合信息（门票+时间+简介+攻略）
+      - "detail": 详细信息（含历史文化背景）
+      - "transport": 侧重交通信息
+      - "tips": 侧重游览建议
+
+    【返回示例】
+    {"name": "大雁塔", "ticket": "50元", "open_time": "08:00-18:00", "summary": "唐代玄奘...", "tips": "建议傍晚前往...", "transport": "地铁3/4号线大雁塔站"}
+
+    【典型使用示例】
+    用户："兵马俑门票多少钱？" → query_attraction(name="兵马俑", info_type="overview")
+    用户："大雁塔怎么去？" → query_attraction(name="大雁塔", info_type="transport")
+    用户："华山有什么好玩的？" → query_attraction(name="华山", info_type="detail")
+    """
+    error = ToolGuard.validate_search_query(name)
+    if error:
+        logger.warning(f"[ToolGuard] query_attraction name参数被拦截: {error}")
+        return _json({"error": error})
+
+    dup_error = ToolGuard.check_duplicate_call(
+        "query_attraction", {"name": name, "info_type": info_type}
+    )
+    if dup_error:
+        return _json({"error": dup_error})
+
+    try:
+        from app.services.attraction_service import format_attraction_for_agent
+
+        result = format_attraction_for_agent(name)
+        return result
+    except Exception as e:
+        logger.error(f"[query_attraction] 景点百科查询异常: {e}")
+        return _json({"error": f"景点查询失败: {e}，请稍后重试或换个景点试试"})
+
+
+# ==================== 交通出行（高德路径规划 API） ====================
+
+@tool
+def query_transit(
+    origin: str,
+    destination: str,
+    mode: str = "transit",
+    city: str = "西安",
+) -> str:
+    """查询两地之间的交通出行方案（公交/地铁/驾车/步行/骑行）。
+
+    【使用场景】✅ 必须在以下情况使用此工具：
+    - 用户问"从XX到XX怎么走"、"去XX坐什么车"
+    - 用户需要公交/地铁/驾车路线规划
+    - 用户问两个景点/地点之间的距离和耗时
+    - 用户比较不同出行方式的优劣
+
+    【不要使用此工具的场景】❌ 以下情况请用其他工具：
+    - 用户只是问景点在哪（地址）→ 用 query_attraction
+    - 用户问景点介绍信息 → 用 query_attraction 或 search_knowledge
+    - 用户问店铺怎么去 → 先用 search_shops_by_name 查到地址
+
+    【参数说明】
+    origin: 出发地（必填）
+      - 地址名如"钟楼"、"西安北站"、"大雁塔"、"回民街"
+      - 或坐标如"108.94,34.26"
+      - ⚠️ 不能为空
+
+    destination: 目的地（必填）
+      - 地址名如"兵马俑"、"华山"、"钟楼"、"华清宫"
+      - 格式同 origin
+      - ⚠️ 不能为空
+
+    mode: 出行方式（可选，默认"transit"=公交/地铁）
+      - "transit": 公交/地铁（推荐）
+      - "driving": 驾车
+      - "walking": 步行
+      - "bicycling": 骑行
+      ⚠️ 只接受这4个值！
+
+    city: 城市（可选，默认"西安"）
+
+    【返回示例】
+    {"origin": "钟楼", "destination": "兵马俑", "duration": "90", "distance": "38000", "steps": [{"type": "subway", "name": "地铁1号线→9号线", ...}]}
+
+    【典型使用示例】
+    用户："钟楼到兵马俑怎么去？" → query_transit(origin="钟楼", destination="兵马俑")
+    用户："西安站到大雁塔地铁多久？" → query_transit(origin="西安站", destination="大雁塔", mode="transit")
+    用户："回民街走到钟楼多远？" → query_transit(origin="回民街", destination="钟楼", mode="walking")
+    """
+    error_origin = ToolGuard.validate_search_query(origin)
+    if error_origin:
+        logger.warning(f"[ToolGuard] query_transit origin被拦截: {error_origin}")
+        return _json({"error": error_origin})
+
+    error_dest = ToolGuard.validate_search_query(destination)
+    if error_dest:
+        logger.warning(f"[ToolGuard] query_transit destination被拦截: {error_dest}")
+        return _json({"error": error_dest})
+
+    valid_modes = {"transit", "driving", "walking", "bicycling"}
+    if mode not in valid_modes:
+        return _json({
+            "error": f"出行方式「{mode}」不合法，可选: {', '.join(sorted(valid_modes))}",
+            "suggestion": "请使用正确的出行方式"
+        })
+
+    dup_error = ToolGuard.check_duplicate_call(
+        "query_transit",
+        {"origin": origin, "destination": destination, "mode": mode, "city": city}
+    )
+    if dup_error:
+        return _json({"error": dup_error})
+
+    try:
+        from app.services.attraction_service import format_transit_for_agent
+
+        result = format_transit_for_agent(
+            origin=origin, destination=destination, city=city, mode=mode
+        )
+        return result
+    except Exception as e:
+        logger.error(f"[query_transit] 交通查询异常: {e}")
+        return _json({"error": f"交通查询失败: {e}，请稍后重试"})
+
+
+# === Phase 2: Agent 工具分组 ===
+SHOP_TOOLS = [search_shops_by_name, list_shops_by_type, get_shop_detail]
+VOUCHER_TOOLS = [list_vouchers]
+BLOG_TOOLS = [search_blogs]
+KNOWLEDGE_TOOLS = [search_knowledge]
+SERVICE_TOOLS = [submit_feedback]
+WEATHER_TOOLS = [query_weather]
+ATTRACTION_TOOLS = [query_attraction]
+TRANSIT_TOOLS = [query_transit]
+
+AGENT_TOOL_MAP = {
+    "shop": SHOP_TOOLS,
+    "voucher": VOUCHER_TOOLS,
+    "blog": BLOG_TOOLS,
+    "knowledge": KNOWLEDGE_TOOLS,
+    "service": SERVICE_TOOLS,
+    "weather": WEATHER_TOOLS,
+    "attraction": ATTRACTION_TOOLS,
+    "transit": TRANSIT_TOOLS,
+}
+
 ALL_TOOLS = [
     search_shops_by_name,
     list_shops_by_type,
@@ -470,6 +690,9 @@ ALL_TOOLS = [
     search_blogs,
     search_knowledge,
     submit_feedback,
+    query_weather,
+    query_attraction,
+    query_transit,
 ]
 
 # ==================== 第一层：Schema 版本管理 ====================
@@ -486,11 +709,15 @@ TOOL_VERSIONS = {
     "search_blogs": "1.0.0",
     "search_knowledge": "1.0.0",
     "submit_feedback": "1.0.0",
+    "query_weather": "1.0.0",
+    "query_attraction": "1.0.0",
+    "query_transit": "1.0.0",
 }
 
 # Schema 变更日志（按版本号记录每次变更）
 SCHEMA_CHANGELOG = {
-    "1.0.0": "初始版本：6个查询工具 + 1个反馈工具，完整的场景描述和参数校验"
+    "1.0.0": "初始版本：6个查询工具 + 1个反馈工具，完整的场景描述和参数校验",
+    "1.1.0": "新增3个工具：query_weather（和风天气）、query_attraction（高德POI+Milvus+预设）、query_transit（高德路径规划）",
 }
 
 

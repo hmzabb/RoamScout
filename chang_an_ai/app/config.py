@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
     embedding_model: str = "BAAI/bge-m3"
 
+    # ---- 外部 API（天气 / 景点 / 交通）----
+    # 和风天气 API（免费版 1000次/天）：https://dev.qweather.com/
+    qweather_api_key: str = ""
+    # 和风天气专属 API Host（新版控制台在「项目管理」页展示，如 abc123.re.qweatherapi.com）
+    # 留空则使用旧域名 geoapi/devapi.qweather.com
+    qweather_api_host: str = ""
+    # 高德地图 API（免费版 5000次/天）：https://lbs.amap.com/
+    amap_api_key: str = ""
+
     # ---- 评分模型（RAGAS evaluator，跨家族：Qwen 评 DeepSeek，避免自评偏差）----
     # 阿里云百炼 DashScope（OpenAI 兼容协议）
     qwen_eval_api_key: str = ""

@@ -81,6 +81,21 @@ class ToolCallAuditor:
         "景点": ["search_knowledge"],
         "门票": ["search_knowledge"],
         "历史": ["search_knowledge"],
+        # 天气意图
+        "天气": ["query_weather"],
+        "下雨": ["query_weather"],
+        "温度": ["query_weather"],
+        "穿衣": ["query_weather"],
+        # 景点百科意图
+        "门票": ["query_attraction", "search_knowledge"],
+        "开放": ["query_attraction", "search_knowledge"],
+        "值得去": ["query_attraction", "search_blogs"],
+        # 交通意图
+        "怎么去": ["query_transit", "query_attraction"],
+        "多远": ["query_transit"],
+        "多久": ["query_transit"],
+        "地铁": ["query_transit"],
+        "公交": ["query_transit"],
     }
 
     @classmethod

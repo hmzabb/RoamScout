@@ -78,6 +78,18 @@ class ToolRetriever:
         "投诉|举报|反馈|客服|人工|退款|建议|坑人|骗人": [
             "submit_feedback"
         ],
+        # 天气查询意图
+        "天气|下雨|下雪|冷|热|温度|气温|刮风|带伞|穿衣|防晒|雾霾|空气质量|多少度|冷不冷|热不热": [
+            "query_weather"
+        ],
+        # 景点百科意图（比search_knowledge更具体的景点信息需求）
+        "门票|开放时间|票价|多少钱|怎么去|怎么走|值得去|好玩吗|介绍|简介|游览|参观": [
+            "query_attraction", "search_knowledge"
+        ],
+        # 交通出行意图
+        "怎么去|怎么走|坐车|地铁|公交|驾车|步行|骑行|多远|多久|路线|导航|打车": [
+            "query_transit", "query_attraction"
+        ],
     }
 
     # 需要发送给LLM的基础工具描述时使用的字段映射
@@ -89,6 +101,9 @@ class ToolRetriever:
         "search_blogs": "搜索平台上的探店笔记/用户评价",
         "search_knowledge": "搜索城市文旅知识（景点/美食/攻略等）",
         "submit_feedback": "收集用户反馈/投诉/建议，记录到后台",
+        "query_weather": "查询城市天气（实时天气+预报+穿衣建议）",
+        "query_attraction": "查询景点百科信息（门票/开放时间/攻略/交通）",
+        "query_transit": "查询两地交通出行方案（公交/地铁/驾车/步行/骑行）",
     }
 
     # 写操作工具（需要人工确认）
